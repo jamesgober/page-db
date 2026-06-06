@@ -463,75 +463,6 @@ impl DerefMut for PageMut<'_> {
     }
 }
 
-#[cfg(test)]
-mod test_support {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
-    use std::collections::HashMap;
-
-    use crate::error::{PageError, PageResult};
-    use crate::page::{Page, PageId, PageSize};
-    use crate::store::PageStore;
-    use crate::sync::{self, Mutex};
-
-    /// An in-memory [`PageStore`] for tests and loom models. It records the
-    /// checksummed bytes of every written page, so a test can assert that an
-    /// evicted dirty page really was flushed before its frame was reused.
-    pub(super) struct MemStore {
-        page_size: usize,
-        pages: Mutex<HashMap<u64, Vec<u8>>>,
-    }
-
-    impl MemStore {
-        pub(super) fn new(page_size: usize) -> Self {
-            Self {
-                page_size,
-                pages: Mutex::new(HashMap::new()),
-            }
-        }
-
-        pub(super) fn contains(&self, id: u64) -> bool {
-            sync::lock(&self.pages).contains_key(&id)
-        }
-    }
-
-    impl PageStore for MemStore {
-        fn page_size(&self) -> usize {
-            self.page_size
-        }
-
-        fn allocate_page(&self) -> Page {
-            Page::new(PageSize::new(self.page_size).unwrap())
-        }
-
-        fn read_into(&self, id: PageId, page: &mut Page) -> PageResult<()> {
-            let pages = sync::lock(&self.pages);
-            match pages.get(&id.get()) {
-                Some(bytes) => {
-                    page.as_bytes_mut().copy_from_slice(bytes);
-                    page.verify(Some(id))
-                }
-                None => Err(PageError::ShortRead {
-                    page_id: id.get(),
-                    got: 0,
-                    page_size: self.page_size,
-                }),
-            }
-        }
-
-        fn write_page(&self, id: PageId, page: &mut Page) -> PageResult<()> {
-            page.stamp(id);
-            let mut pages = sync::lock(&self.pages);
-            let _ = pages.insert(id.get(), page.as_bytes().to_vec());
-            Ok(())
-        }
-
-        fn sync(&self) -> PageResult<()> {
-            Ok(())
-        }
-    }
-}
-
 #[cfg(all(test, not(loom)))]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -540,9 +471,9 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use super::test_support::MemStore;
     use super::*;
     use crate::page::Lsn;
+    use crate::test_store::MemStore;
 
     const PS: usize = 4096;
 
@@ -694,9 +625,9 @@ mod tests {
 
 #[cfg(all(test, loom))]
 mod loom_tests {
-    use super::test_support::MemStore;
     use super::*;
     use crate::sync::Arc;
+    use crate::test_store::MemStore;
 
     /// A pinned page is never evicted: while one thread holds a pin on the only
     /// frame, another thread's attempt to admit a different page fails rather

@@ -119,4 +119,18 @@ pub enum PageError {
         /// The pool's frame capacity.
         capacity: usize,
     },
+
+    /// An id handed to the allocator's `free` is not one it could have
+    /// allocated: it is the reserved superblock (page 0), or it is beyond the
+    /// high-water mark of pages ever allocated.
+    #[error("invalid page id to free: {page_id}")]
+    InvalidPageId {
+        /// The rejected id.
+        page_id: u64,
+    },
+
+    /// The file's page 0 is not a valid allocator superblock. The file was not
+    /// initialized by the allocator, or its superblock is corrupt.
+    #[error("page 0 is not a valid allocator superblock")]
+    InvalidSuperblock,
 }

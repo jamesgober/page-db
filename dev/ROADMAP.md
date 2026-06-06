@@ -15,25 +15,27 @@ Compiles, CI green, structure correct, no domain logic.
 
 ---
 
-## v0.2.0 -- page format + header (CRC32 + LSN) + Direct I/O read/write (THE HARD PART, NOT DEFERRED)
+## v0.2.0 -- page format + header (CRC32C + LSN) + Direct I/O read/write (DONE)
 
 Exit criteria:
-- [ ] Every public item has rustdoc + a runnable example.
-- [ ] Core invariants property-tested.
+- [x] Every public item has rustdoc + a runnable example.
+- [x] Core invariants property-tested.
 
 ---
 
-## v0.3.0 -- LRU buffer pool + pinning + dirty tracking
+## v0.3.0 -- LRU buffer pool + pinning + dirty tracking (DONE)
 
 Exit criteria:
-- [ ] New surface tested; hot paths benchmarked.
+- [x] New surface tested; hot paths benchmarked.
+- [x] Pin/dirty invariants loom-checked.
 
 ---
 
-## v0.4.0 -- page allocator / free-list + cross-platform Direct I/O hardening + feature freeze
+## v0.4.0 -- page allocator / free-list + cross-platform Direct I/O hardening + feature freeze (DONE)
 
 Exit criteria:
-- [ ] No `todo!`/`unimplemented!`. Feature freeze declared.
+- [x] No `todo!`/`unimplemented!`. **Feature freeze declared** -- the public API
+  is complete for 1.0; remaining 0.x work is hardening only.
 
 ---
 

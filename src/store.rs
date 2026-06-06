@@ -64,6 +64,33 @@ pub trait PageStore: Send + Sync {
     fn sync(&self) -> PageResult<()>;
 }
 
+impl<S: PageStore> PageStore for std::sync::Arc<S> {
+    #[inline]
+    fn page_size(&self) -> usize {
+        (**self).page_size()
+    }
+
+    #[inline]
+    fn allocate_page(&self) -> Page {
+        (**self).allocate_page()
+    }
+
+    #[inline]
+    fn read_into(&self, id: PageId, page: &mut Page) -> PageResult<()> {
+        (**self).read_into(id, page)
+    }
+
+    #[inline]
+    fn write_page(&self, id: PageId, page: &mut Page) -> PageResult<()> {
+        (**self).write_page(id, page)
+    }
+
+    #[inline]
+    fn sync(&self) -> PageResult<()> {
+        (**self).sync()
+    }
+}
+
 impl PageStore for crate::file::PageFile {
     #[inline]
     fn page_size(&self) -> usize {

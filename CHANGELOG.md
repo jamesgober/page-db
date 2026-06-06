@@ -8,6 +8,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-05
+
+The page allocator and the **feature freeze**. An id-space allocator over the
+file completes the v0.x surface; with it in place the public API is frozen for
+1.0. Additive — the page, file, and pool APIs are unchanged.
+
+### Added
+
+- `PageAllocator<S = PageFile>` &mdash; allocates and reclaims page ids over a
+  `PageStore`: `open` / `new`, `allocate`, `free`, `high_water`, `free_count`,
+  and `sync`. `allocate` and `free` are pure in-memory operations; the free-list
+  and a high-water mark persist to a superblock at page 0 on `sync`. Reserves
+  page 0; the ids it returns start at 1.
+- `PageStore for Arc<S>` &mdash; so a `PageAllocator` and a `BufferPool` can share
+  one file: wrap a `PageFile` in an `Arc` and hand a clone to each.
+- `PageFile::read_into` is now part of the `PageStore` trait surface used by both
+  the pool and the allocator.
+- `PageError::InvalidPageId` (freeing the superblock or an unallocated id) and
+  `PageError::InvalidSuperblock` (page 0 is not a valid allocator superblock).
+
+### Testing
+
+- Property test: through any sequence of allocates and frees, no id is ever
+  handed out twice while live, and the free count tracks the model exactly.
+- Allocator state (high-water mark and free-list) round-trips across a reopen.
+- `loom` model check: concurrent allocations never collide.
+- An end-to-end test drives the allocator and the buffer pool over one shared
+  file and confirms both the ids and the page data survive a reopen.
+- Direct I/O round-trip verified across page sizes 4 KiB through 64 KiB.
+
+### Notes
+
+- **Feature freeze.** The public API is frozen for 1.0. Remaining 0.x work is
+  hardening: torn-page / corruption fuzzing and alignment edge cases, then the
+  API freeze is made formal at 0.5.0.
+- The on-disk format remains unstable across 0.x and is frozen for 1.x before
+  1.0.
+
 ## [0.3.0] - 2026-06-05
 
 The buffer pool: a bounded in-memory cache of pages over the file, with pinning
@@ -106,7 +144,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` (Node 24 actions; fmt, clippy, test, doc, audit, deny) and `.github/FUNDING.yml`.
 
 <!-- LINKS -->
-[Unreleased]: https://github.com/jamesgober/page-db/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/page-db/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/page-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/page-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/page-db/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/page-db/releases/tag/v0.1.0

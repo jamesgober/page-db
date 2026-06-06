@@ -6,7 +6,7 @@
 //! barrier dominating every sample; `sync` is measured separately.
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use page_db::{BufferPool, Lsn, PageFileOptions, PageId, crc32c};
+use page_db::{BufferPool, Lsn, PageAllocator, PageFileOptions, PageId, PageSize, crc32c};
 
 fn bench_crc32c(c: &mut Criterion) {
     let mut group = c.benchmark_group("crc32c");
@@ -120,6 +120,29 @@ fn bench_pool_miss(c: &mut Criterion) {
     });
 }
 
+fn bench_alloc(c: &mut Criterion) {
+    let page_size = PageSize::new(4096).expect("valid");
+
+    // Steady-state allocate/free of a single id: pop the free-list and push it
+    // back, so the high-water mark and the free-list both stay warm.
+    let alloc = PageAllocator::open(temp_path("alloc-free"), page_size).expect("open");
+    let id = alloc.allocate().expect("allocate");
+    let _ = c.bench_function("alloc_free_cycle", |b| {
+        b.iter(|| {
+            alloc.free(black_box(id)).expect("free");
+            black_box(alloc.allocate().expect("allocate"));
+        });
+    });
+
+    // Fresh allocation that extends the high-water mark (no free-list reuse).
+    let alloc2 = PageAllocator::open(temp_path("alloc-extend"), page_size).expect("open");
+    let _ = c.bench_function("alloc_extend", |b| {
+        b.iter(|| {
+            black_box(alloc2.allocate().expect("allocate"));
+        });
+    });
+}
+
 fn temp_path(tag: &str) -> std::path::PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!("page-db-bench-{tag}-{}.pages", std::process::id()));
@@ -133,6 +156,7 @@ criterion_group!(
     bench_read,
     bench_write_sync,
     bench_pool_hit,
-    bench_pool_miss
+    bench_pool_miss,
+    bench_alloc
 );
 criterion_main!(benches);

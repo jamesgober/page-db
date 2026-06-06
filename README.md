@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Fixed-size pages. CRC32C + LSN headers. Cross-platform Direct I/O.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> As of <code>v0.3.0</code> the page format, the durable Direct I/O file, and the LRU buffer pool with pinning and dirty tracking are implemented; the page allocator (a free-list over the file) is the remaining 0.x piece per <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. The on-disk format is unstable until 1.0; the public API is frozen at <code>1.0.0</code>.
+        <strong>Status: pre-1.0, feature-frozen.</strong> As of <code>v0.4.0</code> the page format, the durable Direct I/O file, the LRU buffer pool with pinning and dirty tracking, and the page-id allocator are all implemented, and the public API is frozen for 1.0. Remaining 0.x work is hardening (fuzzing, alignment edge cases) per <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. The on-disk format is unstable until 1.0.
     </blockquote>
 </div>
 
@@ -38,18 +38,13 @@
 
 <h2>What it does</h2>
 
-Shipping as of `v0.3.0`:
-
 - **Fixed-size pages** &mdash; configurable page size (4 KiB&ndash;1 MiB); a versioned 32-byte header with magic, CRC32C, page id, and an LSN slot
 - **CRC32C integrity** &mdash; every page is checksummed; a torn, corrupt, or misdirected page is detected on read and returned as a typed error, never silently trusted
 - **Cross-platform Direct I/O** &mdash; O_DIRECT (Linux), F_NOCACHE (macOS), FILE_FLAG_NO_BUFFERING (Windows), into buffers aligned to the page size, with a buffered fallback for filesystems that reject it
 - **Durable on demand** &mdash; `write_page` places bytes, `sync` makes them durable (fdatasync / FlushFileBuffers / macOS F_FULLFSYNC)
 - **LRU buffer pool** &mdash; a bounded frame cache over the file with clock (second-chance) eviction
 - **Pinning &amp; dirty tracking** &mdash; a pinned page is never evicted; a dirty page is always flushed before its frame is reused &mdash; both verified by property tests and `loom` model checks
-
-Landing next (see [`dev/ROADMAP.md`](./dev/ROADMAP.md)):
-
-- **Page allocation** &mdash; a free-list / allocator for new and reclaimed page ids
+- **Page-id allocator** &mdash; an on-disk free-list that hands out unused ids and reclaims freed ones; `allocate` and `free` are pure in-memory operations
 
 <br>
 <hr>
@@ -59,7 +54,7 @@ Landing next (see [`dev/ROADMAP.md`](./dev/ROADMAP.md)):
 
 ```toml
 [dependencies]
-page-db = "0.3"
+page-db = "0.4"
 ```
 
 <br>
@@ -117,16 +112,42 @@ fn main() -> Result<(), page_db::PageError> {
 
 <br>
 
+To put a whole engine layer together, the allocator picks ids and the pool
+caches the pages at them, both over one shared file:
+
+```rust
+use std::sync::Arc;
+use page_db::{BufferPool, PageAllocator, PageFile, DEFAULT_PAGE_SIZE};
+
+fn main() -> Result<(), page_db::PageError> {
+    let store = Arc::new(PageFile::open("data.pages", DEFAULT_PAGE_SIZE)?);
+    let alloc = PageAllocator::new(Arc::clone(&store))?;
+    let pool = BufferPool::new(Arc::clone(&store), 128);
+
+    let id = alloc.allocate()?;          // allocator chooses the id
+    {
+        let guard = pool.new_page(id)?;  // pool caches the page there
+        guard.write().payload_mut()[0] = 0x7;
+    }
+    pool.flush_all()?;
+    alloc.sync()?;                       // persist allocator state + page data
+    Ok(())
+}
+```
+
+<br>
+
 ## API Overview
 
 For the complete reference with examples, see [`docs/API.md`](./docs/API.md).
 
 - [`BufferPool`](./docs/API.md#bufferpool) &mdash; the bounded page cache with pinning and dirty tracking
 - [`PageGuard`](./docs/API.md#pageguard-pageref-pagemut) &mdash; an RAII pin on a cached page; `read` / `write` borrows
+- [`PageAllocator`](./docs/API.md#pageallocator) &mdash; the page-id allocator with an on-disk free-list
 - [`PageFile`](./docs/API.md#pagefile) / [`PageFileOptions`](./docs/API.md#pagefileoptions) &mdash; the durable page store and its open options
 - [`Page`](./docs/API.md#page) &mdash; a fixed-size page: header accessors, payload, checksummed framing
 - [`PageId`](./docs/API.md#pageid) / [`Lsn`](./docs/API.md#lsn) / [`PageSize`](./docs/API.md#pagesize) &mdash; the value types
-- [`PageStore`](./docs/API.md#pagestore) &mdash; the storage seam the pool sits on
+- [`PageStore`](./docs/API.md#pagestore) &mdash; the storage seam the pool and allocator sit on
 - [`PageError`](./docs/API.md#pageerror--pageresult) &mdash; typed integrity and I/O failures
 - [`crc32c`](./docs/API.md#checksum--crc32c) &mdash; the CRC32C checksum, exposed directly
 

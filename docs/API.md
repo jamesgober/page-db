@@ -15,10 +15,10 @@
 <br>
 
 > Complete reference for every public item in `page-db`, with examples.
-> **Status: pre-1.0.** The surface below is what ships in `v0.3.0` — the page
-> format, the Direct I/O file, and the buffer pool. The page allocator (a
-> free-list over the file) is the remaining 0.x piece (see
-> [`dev/ROADMAP.md`](../dev/ROADMAP.md)); the public API is frozen at `1.0.0`.
+> **Status: pre-1.0, feature-frozen.** The surface below — the page format, the
+> Direct I/O file, the buffer pool, and the allocator — is the complete API as of
+> `v0.4.0`; it is frozen for 1.0. Remaining 0.x work is hardening only (see
+> [`dev/ROADMAP.md`](../dev/ROADMAP.md)).
 
 ## Table of Contents
 
@@ -35,6 +35,7 @@
   - [`PageFileOptions`](#pagefileoptions)
   - [`BufferPool`](#bufferpool)
   - [`PageGuard`, `PageRef`, `PageMut`](#pageguard-pageref-pagemut)
+  - [`PageAllocator`](#pageallocator)
   - [`PageStore`](#pagestore)
   - [`PageError` & `PageResult`](#pageerror--pageresult)
   - [`checksum` — CRC32C](#checksum--crc32c)
@@ -47,14 +48,14 @@
 
 ```toml
 [dependencies]
-page-db = "0.3"
+page-db = "0.4"
 ```
 
 With serde derives on the small value types:
 
 ```toml
 [dependencies]
-page-db = { version = "0.3", features = ["serde"] }
+page-db = { version = "0.4", features = ["serde"] }
 ```
 
 MSRV: Rust 1.85 (2024 edition).
@@ -114,6 +115,13 @@ unpins it. Writing through the guard marks the page **dirty**, and a dirty page
 is always flushed to the store before its frame is reused. When every frame is
 pinned, the pool returns [`BufferPoolExhausted`](#pageerror--pageresult) rather
 than evict something it must not.
+
+A [`PageAllocator`](#pageallocator) manages the **id space**:
+[`allocate`](#pageallocator) hands out an unused id, [`free`](#pageallocator)
+returns one for reuse. It reserves page 0 for its own on-disk state (a
+superblock plus a free-list), so the ids it returns start at 1. Pair it with a
+pool over the same file — wrap the [`PageFile`](#pagefile) in an `Arc` and give a
+clone to each, since [`Arc<S>` is itself a `PageStore`](#pagestore).
 
 <br>
 
@@ -576,12 +584,86 @@ assert_eq!(guard.id(), PageId::new(0));
 
 <br>
 
+### `PageAllocator`
+
+Hands out and reclaims page ids over a [`PageStore`](#pagestore).
+`PageAllocator<S = PageFile>` reserves page 0 for its on-disk state (a superblock
+and a free-list), so the ids it returns start at 1. `allocate` and `free` are
+in-memory; the state is written to disk by `sync`. `Send + Sync`, every method
+takes `&self`.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `open` | `fn open<P: AsRef<Path>>(path: P, page_size: PageSize) -> PageResult<PageAllocator<PageFile>>` | Open a file and an allocator over it. |
+| `new` | `fn new(store: S) -> PageResult<PageAllocator<S>>` | Build an allocator over any store. |
+| `allocate` | `fn allocate(&self) -> PageResult<PageId>` | Return an unused id (reused if freed, else a new one). |
+| `free` | `fn free(&self, id: PageId) -> PageResult<()>` | Return an id to the free-list for reuse. |
+| `high_water` | `fn high_water(&self) -> u64` | One past the highest id ever handed out. |
+| `free_count` | `fn free_count(&self) -> u64` | Ids currently free for reuse. |
+| `sync` | `fn sync(&self) -> PageResult<()>` | Persist the superblock + free-list, then sync the store. |
+
+**Durability.** `allocate` and `free` touch only memory; `sync` writes the state
+to disk. Call it as part of the same checkpoint that makes the allocated pages
+durable — the high-water mark must reach stable storage no later than the data
+written beyond it. The write-ahead log above is the authority on crash recovery.
+
+**Errors.** `free` returns [`InvalidPageId`](#pageerror--pageresult) for the
+reserved id 0 or an id that was never allocated. `new` / `open` returns
+[`InvalidSuperblock`](#pageerror--pageresult) if page 0 exists but is not a
+superblock the allocator wrote.
+
+**Allocate, free, reuse.**
+
+```rust
+use page_db::{PageAllocator, DEFAULT_PAGE_SIZE};
+
+# let dir = tempfile::tempdir().unwrap();
+# let path = dir.path().join("data.pages");
+let alloc = PageAllocator::open(&path, DEFAULT_PAGE_SIZE)?;
+
+let a = alloc.allocate()?;   // 1
+let b = alloc.allocate()?;   // 2
+assert_eq!(alloc.high_water(), 3);
+
+alloc.free(a)?;              // a goes on the free-list
+assert_eq!(alloc.free_count(), 1);
+let c = alloc.allocate()?;   // reuses a
+assert_eq!(c, a);
+assert_ne!(c, b);
+
+alloc.sync()?;               // persist the allocator state durably
+# Ok::<(), page_db::PageError>(())
+```
+
+**Sharing a file with a pool.** Wrap the file in an `Arc` and give a clone to
+each; `Arc<PageFile>` is a [`PageStore`](#pagestore).
+
+```rust
+use std::sync::Arc;
+use page_db::{BufferPool, PageAllocator, PageFile, PageId, DEFAULT_PAGE_SIZE};
+
+# let dir = tempfile::tempdir().unwrap();
+# let path = dir.path().join("data.pages");
+let store = Arc::new(PageFile::open(&path, DEFAULT_PAGE_SIZE)?);
+let alloc = PageAllocator::new(Arc::clone(&store))?;
+let pool = BufferPool::new(Arc::clone(&store), 128);
+
+let id = alloc.allocate()?;                 // allocator picks the id
+let guard = pool.new_page(id)?;             // pool caches the page there
+guard.write().payload_mut()[0] = 0x7;
+pool.flush_all()?;
+alloc.sync()?;                              // persist allocator + page data
+# let _ = PageId::new(0);
+# Ok::<(), page_db::PageError>(())
+```
+
+<br>
+
 ### `PageStore`
 
-The storage seam the buffer pool sits on. [`PageFile`](#pagefile) implements it;
-the pool is written against the trait so it can be driven by an in-memory store
-in tests or an alternative backend later. Most users never name this trait —
-they pass a `PageFile` to [`BufferPool::open`](#bufferpool).
+The storage seam the buffer pool and allocator sit on. [`PageFile`](#pagefile)
+implements it, and so does `Arc<S>` for any `S: PageStore` — which is how a pool
+and an allocator share one file. Most users never name this trait directly.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
@@ -620,6 +702,8 @@ match with a wildcard arm.
 | `MisdirectedPage { requested, found }` | The slot holds a page stamped with a different id. | A misdirected read/write — surface as corruption. |
 | `ShortRead { page_id, got, page_size }` | The slot is past end-of-file, or the file is not a whole number of pages. | Allocate the slot first, or check `page_count`. |
 | `BufferPoolExhausted { capacity }` | Every frame in a [`BufferPool`](#bufferpool) is pinned. | Release some [`PageGuard`](#pageguard-pageref-pagemut)s, or size the pool larger. |
+| `InvalidPageId { page_id }` | An id handed to [`PageAllocator::free`](#pageallocator) is the reserved superblock (0) or was never allocated. | Free only ids the allocator returned, exactly once. |
+| `InvalidSuperblock` | Page 0 is not a valid allocator superblock. | The file was not initialized by the allocator, or it is corrupt. |
 
 ```rust
 use page_db::{PageFile, PageId, PageError, DEFAULT_PAGE_SIZE};
@@ -704,12 +788,16 @@ The crate is `std`-only: a file-backed, Direct-I/O page store is inherently
 - **Direct I/O alignment** is handled for you: page buffers are aligned to the
   page size, which satisfies the block-alignment rules on every supported
   platform for page sizes of 4 KiB and up.
-- **Thread safety.** `PageFile`, `BufferPool`, `Page`, `PageId`, and `Lsn` are
-  `Send + Sync`. `PageFile`'s concurrent positioned reads and writes do not
-  contend on a shared cursor; the caller is responsible for not writing the same
-  slot from two threads at once. `BufferPool` is internally synchronized — its
-  pin/evict/dirty invariants are verified under `loom` — so it is shared across
-  threads behind an `Arc` directly.
+- **Thread safety.** `PageFile`, `BufferPool`, `PageAllocator`, `Page`, `PageId`,
+  and `Lsn` are `Send + Sync`. `PageFile`'s concurrent positioned reads and
+  writes do not contend on a shared cursor; the caller is responsible for not
+  writing the same slot from two threads at once. `BufferPool` and
+  `PageAllocator` are internally synchronized — their concurrency invariants are
+  verified under `loom` — so each is shared across threads behind an `Arc`
+  directly.
+- **Allocator and pool over one file.** Wrap the `PageFile` in an `Arc` and hand
+  a clone to each (`Arc<S>: PageStore`). The allocator owns page 0; do not use it
+  for data, and free a page only once it is no longer cached or in use.
 
 ---
 

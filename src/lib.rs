@@ -5,13 +5,15 @@
 //! check and an LSN slot for write-ahead-log coordination, read and written
 //! through cross-platform Direct I/O that bypasses the OS page cache.
 //!
-//! Two layers ship today. The [`PageFile`] is the durable foundation: an array
+//! Three layers ship today. The [`PageFile`] is the durable foundation: an array
 //! of fixed-size [`Page`]s addressed by [`PageId`], read and written through
 //! Direct I/O, every read verified against its header and checksum. The
 //! [`BufferPool`] sits on top: a bounded cache of frames with pinning and dirty
 //! tracking, so hot pages stay resident and the engine above asks for a page by
-//! id and gets back a pinned frame. The page allocator (a free-list over the
-//! file) is the remaining 0.x piece; see `dev/ROADMAP.md`.
+//! id and gets back a pinned frame. The [`PageAllocator`] manages the id space:
+//! it hands out unused ids and reclaims freed ones through an on-disk free-list.
+//! Compose them over one shared store with `Arc` (see [`PageStore`]). The public
+//! API is feature-frozen as of v0.4.0; see `dev/ROADMAP.md`.
 //!
 //! ## Straight to the file
 //!
@@ -80,6 +82,7 @@
 #![deny(clippy::dbg_macro)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+mod alloc;
 mod buffer;
 pub mod checksum;
 mod error;
@@ -89,7 +92,10 @@ mod pool;
 mod store;
 mod sync;
 mod sys;
+#[cfg(test)]
+mod test_store;
 
+pub use crate::alloc::PageAllocator;
 pub use crate::checksum::crc32c;
 pub use crate::error::{PageError, PageResult};
 pub use crate::file::{PageFile, PageFileOptions};
