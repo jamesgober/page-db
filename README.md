@@ -26,10 +26,10 @@
     <br>
     <hr>
     <p>
-        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Fixed-size pages. CRC32 + LSN headers. LRU buffer pool. Direct I/O.
+        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Fixed-size pages. CRC32C + LSN headers. Cross-platform Direct I/O.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> This is the <code>v0.1.0</code> scaffold &mdash; structure, tooling, and CI gates are in place; the implementation lands across the 0.x series per <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. The public API is frozen at <code>1.0.0</code>.
+        <strong>Status: pre-1.0, in active development.</strong> As of <code>v0.2.0</code> the page format and the durable Direct I/O file are implemented; the LRU buffer pool, pinning, and the page allocator land across the rest of the 0.x series per <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. The on-disk format is unstable until 1.0; the public API is frozen at <code>1.0.0</code>.
     </blockquote>
 </div>
 
@@ -38,11 +38,17 @@
 
 <h2>What it does</h2>
 
-- **Fixed-size pages** &mdash; configurable page size; a versioned page header with magic, CRC32, and an LSN slot
-- **CRC32 integrity** &mdash; every page is checksummed; a torn or corrupt page is detected on read, never silently trusted
+Shipping as of `v0.2.0`:
+
+- **Fixed-size pages** &mdash; configurable page size (4 KiB&ndash;1 MiB); a versioned 32-byte header with magic, CRC32C, page id, and an LSN slot
+- **CRC32C integrity** &mdash; every page is checksummed; a torn, corrupt, or misdirected page is detected on read and returned as a typed error, never silently trusted
+- **Cross-platform Direct I/O** &mdash; O_DIRECT (Linux), F_NOCACHE (macOS), FILE_FLAG_NO_BUFFERING (Windows), into buffers aligned to the page size, with a buffered fallback for filesystems that reject it
+- **Durable on demand** &mdash; `write_page` places bytes, `sync` makes them durable (fdatasync / FlushFileBuffers / macOS F_FULLFSYNC)
+
+Landing across the rest of the 0.x series (see [`dev/ROADMAP.md`](./dev/ROADMAP.md)):
+
 - **LRU buffer pool** &mdash; bounded in-memory frame cache with clock/LRU eviction
 - **Dirty-page pinning** &mdash; pin pages against eviction while in use; track and flush dirty frames on a schedule
-- **Cross-platform Direct I/O** &mdash; O_DIRECT (Linux), F_NOCACHE (macOS), FILE_FLAG_NO_BUFFERING (Windows), with aligned buffers
 - **Page allocation** &mdash; a free-list / allocator for new and reclaimed page ids
 
 <br>
@@ -53,19 +59,50 @@
 
 ```toml
 [dependencies]
-page-db = "0.1"
+page-db = "0.2"
 ```
+
+<br>
+
+## Usage
+
+```rust
+use page_db::{PageFile, PageId, Lsn, DEFAULT_PAGE_SIZE};
+
+fn main() -> Result<(), page_db::PageError> {
+    // A 4 KiB-page file, Direct I/O, created if absent.
+    let file = PageFile::open("data.pages", DEFAULT_PAGE_SIZE)?;
+
+    // Fill a page, tag it with a log sequence number, write it to slot 0.
+    let mut page = file.allocate_page();
+    page.set_lsn(Lsn::new(1));
+    page.payload_mut()[..5].copy_from_slice(b"hello");
+    file.write_page(PageId::new(0), &mut page)?;
+    file.sync()?;
+
+    // Read it back — the header and checksum are verified on the way out.
+    let got = file.read_page(PageId::new(0))?;
+    assert_eq!(&got.payload()[..5], b"hello");
+    assert_eq!(got.lsn(), Lsn::new(1));
+    Ok(())
+}
+```
+
+On a filesystem that rejects `O_DIRECT` (some overlay and network mounts), open
+with `PageFileOptions::new().direct_io(false)` — same API, same durability via
+`sync`, only the page cache differs.
 
 <br>
 
 ## API Overview
 
-For the complete reference, see [`docs/API.md`](./docs/API.md).
+For the complete reference with examples, see [`docs/API.md`](./docs/API.md).
 
-- [`Fixed-size pages`](./docs/API.md)
-- [`CRC32 integrity`](./docs/API.md)
-- [`LRU buffer pool`](./docs/API.md)
-- [`Dirty-page pinning`](./docs/API.md)
+- [`PageFile`](./docs/API.md#pagefile) / [`PageFileOptions`](./docs/API.md#pagefileoptions) &mdash; the durable page store and its open options
+- [`Page`](./docs/API.md#page) &mdash; a fixed-size page: header accessors, payload, checksummed framing
+- [`PageId`](./docs/API.md#pageid) / [`Lsn`](./docs/API.md#lsn) / [`PageSize`](./docs/API.md#pagesize) &mdash; the value types
+- [`PageError`](./docs/API.md#pageerror--pageresult) &mdash; typed integrity and I/O failures
+- [`crc32c`](./docs/API.md#checksum--crc32c) &mdash; the CRC32C checksum, exposed directly
 
 <br>
 <hr>
@@ -80,7 +117,7 @@ For the complete reference, see [`docs/API.md`](./docs/API.md).
 - [`wal-db`](https://github.com/jamesgober/wal-db) &mdash; the LSN slot in each page header coordinates with the write-ahead log
 - heap / B-tree engines &mdash; any storage engine that needs durable, cached, fixed-size pages
 
-It has no first-party dependencies, so it builds and tests standalone today.
+It depends on no sibling crates &mdash; only `thiserror` (error types) and, on Unix, `libc` (for `O_DIRECT` and the macOS durability syscalls) &mdash; so it builds and tests standalone today.
 
 <br>
 

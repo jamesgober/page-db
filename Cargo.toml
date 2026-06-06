@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "page-db"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -61,16 +61,22 @@ path = "src/lib.rs"
 # FEATURE FLAGS
 # #################################
 [features]
-default = ["std"]
-std = []
-# Serialization for public types.
+default = []
+# Serde derives for the small public value types (PageId, Lsn, PageSize).
 serde = ["dep:serde"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
+# Typed, source-preserving error variants for a library crate (REPS: thiserror for libs).
+thiserror = "2"
+serde = { version = "1", optional = true, default-features = false, features = ["derive"] }
+
+# O_DIRECT, F_NOCACHE, and F_FULLFSYNC are not exposed by std; libc is the
+# standard Unix platform-abstraction crate (REPS endorses it over raw FFI).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 
 # DEV DEPENDENCIES
@@ -78,6 +84,7 @@ serde = { version = "1", optional = true, default-features = false, features = [
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
+tempfile  = "3"
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
