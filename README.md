@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Fixed-size pages. CRC32C + LSN headers. Cross-platform Direct I/O.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, API frozen.</strong> As of <code>v0.5.0</code> the page format, the durable Direct I/O file, the LRU buffer pool with pinning and dirty tracking, and the page-id allocator are all implemented; the parse and recovery paths are fuzzed, and the public API is frozen for 1.0. The remaining road to 1.0 is integration soak and the on-disk-format freeze per <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. The on-disk format is unstable until 1.0.
+        <strong>Status: stable (<code>v1.0.0</code>).</strong> The page format, the durable Direct I/O file, the LRU buffer pool with pinning and dirty tracking, and the page-id allocator are complete, fuzzed, loom-checked, and stress-tested. The public API is frozen until 2.0, and the <a href="./docs/ON_DISK_FORMAT.md">on-disk format</a> is frozen for the 1.x line — a file written by any 1.x release reads back on any other.
     </blockquote>
 </div>
 
@@ -54,7 +54,7 @@
 
 ```toml
 [dependencies]
-page-db = "0.5"
+page-db = "1.0"
 ```
 
 <br>
@@ -150,6 +150,8 @@ For the complete reference with examples, see [`docs/API.md`](./docs/API.md).
 - [`PageStore`](./docs/API.md#pagestore) &mdash; the storage seam the pool and allocator sit on
 - [`PageError`](./docs/API.md#pageerror--pageresult) &mdash; typed integrity and I/O failures
 - [`crc32c`](./docs/API.md#checksum--crc32c) &mdash; the CRC32C checksum, exposed directly
+
+See also the [On-Disk Format](./docs/ON_DISK_FORMAT.md) (the bytes page-db writes, frozen for 1.x) and the [Benchmarks](./docs/BENCHMARKS.md).
 
 <br>
 <hr>

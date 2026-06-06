@@ -8,6 +8,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-06
+
+**The first stable release.** The public API is frozen until 2.0 and the on-disk
+format is frozen for the 1.x line — a file written by any 1.x release reads back
+identically on any other. There are no API or on-disk changes since 0.5.0; 1.0.0
+is the commitment to a surface built, measured, and hardened across the 0.x
+series.
+
+### Added
+
+- [`docs/ON_DISK_FORMAT.md`](docs/ON_DISK_FORMAT.md) — the normative specification
+  of the page header, the allocator superblock, and the free-list chain, frozen
+  for 1.x.
+- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — the hot-path numbers and the method
+  behind them.
+- A concurrency stress test: eight threads drive the allocator and the buffer pool
+  over one shared file with the pool far smaller than the working set, then the
+  data is verified cold after a reopen.
+- An I/O fault-injection test: injected read and write failures propagate as
+  `PageError::Io` through the pool and the allocator, never a panic or a swallowed
+  error.
+
+### Stability
+
+- **API frozen until 2.0.** Every public item is stable. `PageError` is
+  `#[non_exhaustive]` and `PageFileOptions` is a builder, so the surface can grow
+  additively within 1.x without a breaking change.
+- **On-disk format frozen for 1.x.** The page header and the allocator superblock
+  will not change in a backward-incompatible way within 1.x. See
+  [`docs/ON_DISK_FORMAT.md`](docs/ON_DISK_FORMAT.md).
+- `cargo audit` and `cargo deny check` are clean.
+
 ## [0.5.0] - 2026-06-05
 
 Hardening and the **formal API freeze**. Fuzzing the parse and recovery paths
@@ -178,7 +210,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` (Node 24 actions; fmt, clippy, test, doc, audit, deny) and `.github/FUNDING.yml`.
 
 <!-- LINKS -->
-[Unreleased]: https://github.com/jamesgober/page-db/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/page-db/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/jamesgober/page-db/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/jamesgober/page-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/page-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/page-db/compare/v0.2.0...v0.3.0

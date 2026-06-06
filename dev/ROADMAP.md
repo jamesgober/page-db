@@ -52,9 +52,17 @@ Exit criteria:
 
 ---
 
-## v0.6.0 -> v1.0.0 -- Alpha / Beta / RC / Stable
+## v1.0.0 -- Stable (DONE)
 
-Integrate against real consumers, broaden testing, capture final benchmarks, then freeze the public API until 2.0 and publish.
+Shipped straight to stable. Broadened testing (multi-threaded stress + I/O
+fault-injection on top of the loom models, property tests, and fuzzing), captured
+final benchmarks ([`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md)), and froze the
+on-disk format for 1.x ([`docs/ON_DISK_FORMAT.md`](../docs/ON_DISK_FORMAT.md)).
+
+Exit criteria:
+- [x] **API frozen until 2.0.** On-disk format frozen for 1.x.
+- [x] Full suite green on Linux/macOS/Windows, stable + MSRV; `cargo audit` +
+  `cargo deny` clean.
 
 ---
 

@@ -15,11 +15,11 @@
 <br>
 
 > Complete reference for every public item in `page-db`, with examples.
-> **Status: pre-1.0, API frozen.** The surface below — the page format, the
-> Direct I/O file, the buffer pool, and the allocator — is the complete API as of
-> `v0.5.0`; it is frozen for 1.0 (no further additions, only bug fixes and the
-> on-disk-format freeze). The parse and recovery paths are fuzzed (see
-> [`dev/ROADMAP.md`](../dev/ROADMAP.md)).
+> **Status: stable (`v1.0.0`).** The surface below — the page format, the Direct
+> I/O file, the buffer pool, and the allocator — is **frozen until 2.0**. The
+> [on-disk format](./ON_DISK_FORMAT.md) is frozen for the 1.x line. The parse and
+> recovery paths are fuzzed, the concurrency invariants are loom-checked, and the
+> whole stack is stress-tested.
 
 ## Table of Contents
 
@@ -49,14 +49,14 @@
 
 ```toml
 [dependencies]
-page-db = "0.5"
+page-db = "1.0"
 ```
 
 With serde derives on the small value types:
 
 ```toml
 [dependencies]
-page-db = { version = "0.5", features = ["serde"] }
+page-db = { version = "1.0", features = ["serde"] }
 ```
 
 MSRV: Rust 1.85 (2024 edition).
