@@ -183,6 +183,27 @@ impl PageFile {
     /// - [`PageError::Io`] on an I/O failure.
     pub fn read_page(&self, id: PageId) -> PageResult<Page> {
         let mut page = Page::new(self.page_size);
+        self.read_into(id, &mut page)?;
+        Ok(page)
+    }
+
+    /// Read the page at slot `id` into an existing buffer, verifying it.
+    ///
+    /// This is the zero-allocation form of [`read_page`](PageFile::read_page):
+    /// it reuses `page`'s buffer instead of allocating a fresh one, which is how
+    /// a buffer pool recycles a frame on a cache miss. `page.page_size()` must
+    /// match the file's.
+    ///
+    /// # Errors
+    ///
+    /// As [`read_page`](PageFile::read_page), plus
+    /// [`PageError::InvalidPageSize`] if `page`'s size does not match the file's.
+    pub fn read_into(&self, id: PageId, page: &mut Page) -> PageResult<()> {
+        if page.page_size() != self.page_size.get() {
+            return Err(PageError::InvalidPageSize {
+                size: page.page_size(),
+            });
+        }
         let offset = id.byte_offset(self.page_size.get());
         let got = sys::read_at_full(&self.file, page.as_bytes_mut(), offset)?;
         if got != self.page_size.get() {
@@ -193,7 +214,7 @@ impl PageFile {
             });
         }
         page.verify(Some(id))?;
-        Ok(page)
+        Ok(())
     }
 
     /// Write `page` to slot `id`, stamping the slot id and a fresh checksum.

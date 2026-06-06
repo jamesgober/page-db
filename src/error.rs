@@ -110,4 +110,13 @@ pub enum PageError {
         /// The configured page size.
         page_size: usize,
     },
+
+    /// A buffer pool could not admit another page because every frame is
+    /// pinned. The pool refuses to evict a pinned page, so this is the signal to
+    /// release some pins or size the pool larger.
+    #[error("buffer pool exhausted: all {capacity} frames are pinned")]
+    BufferPoolExhausted {
+        /// The pool's frame capacity.
+        capacity: usize,
+    },
 }

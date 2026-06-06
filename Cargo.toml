@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "page-db"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -56,6 +56,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 [lib]
 name = "page_db"
 path = "src/lib.rs"
+
+# `--cfg loom` swaps in loom's instrumented concurrency primitives for the
+# buffer-pool model checks; declare it so the compiler does not flag it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 
 # FEATURE FLAGS

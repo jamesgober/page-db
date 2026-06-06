@@ -5,15 +5,16 @@
 //! check and an LSN slot for write-ahead-log coordination, read and written
 //! through cross-platform Direct I/O that bypasses the OS page cache.
 //!
-//! This is the v0.2.0 layer: the page format and the durable file underneath
-//! it. The LRU buffer pool, pinning, and the page allocator land in later 0.x
-//! releases (see `dev/ROADMAP.md`). The buffer pool that will sit on top of
-//! [`PageFile`] is not here yet; today you read and write pages straight
-//! through to disk.
+//! Two layers ship today. The [`PageFile`] is the durable foundation: an array
+//! of fixed-size [`Page`]s addressed by [`PageId`], read and written through
+//! Direct I/O, every read verified against its header and checksum. The
+//! [`BufferPool`] sits on top: a bounded cache of frames with pinning and dirty
+//! tracking, so hot pages stay resident and the engine above asks for a page by
+//! id and gets back a pinned frame. The page allocator (a free-list over the
+//! file) is the remaining 0.x piece; see `dev/ROADMAP.md`.
 //!
-//! ## The shape of it
+//! ## Straight to the file
 //!
-//! A [`PageFile`] is an array of fixed-size [`Page`]s addressed by [`PageId`].
 //! Every page carries a header; on write the header's checksum is stamped over
 //! the page bytes, and on read it is verified before the page is handed back —
 //! a corrupt or misdirected page is a typed [`PageError`], never a silent read.
@@ -42,6 +43,28 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## Through the buffer pool
+//!
+//! ```no_run
+//! use page_db::{BufferPool, PageId, Lsn, DEFAULT_PAGE_SIZE};
+//!
+//! # fn main() -> Result<(), page_db::PageError> {
+//! let pool = BufferPool::open("data.pages", DEFAULT_PAGE_SIZE, 256)?;
+//!
+//! // Create a page; writing through the guard marks the frame dirty.
+//! {
+//!     let guard = pool.new_page(PageId::new(0))?;
+//!     guard.write().set_lsn(Lsn::new(1));
+//! }
+//! pool.checkpoint()?;   // flush dirty frames, then make the file durable
+//!
+//! // Fetch it — served from cache, the page stays pinned for the guard's life.
+//! let guard = pool.fetch(PageId::new(0))?;
+//! assert_eq!(guard.read().lsn(), Lsn::new(1));
+//! # Ok(())
+//! # }
+//! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
@@ -62,6 +85,9 @@ pub mod checksum;
 mod error;
 mod file;
 mod page;
+mod pool;
+mod store;
+mod sync;
 mod sys;
 
 pub use crate::checksum::crc32c;
@@ -70,3 +96,5 @@ pub use crate::file::{PageFile, PageFileOptions};
 pub use crate::page::{
     DEFAULT_PAGE_SIZE, Lsn, MAX_PAGE_SIZE, MIN_PAGE_SIZE, PAGE_HEADER_SIZE, Page, PageId, PageSize,
 };
+pub use crate::pool::{BufferPool, PageGuard, PageMut, PageRef};
+pub use crate::store::PageStore;

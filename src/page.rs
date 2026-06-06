@@ -307,6 +307,16 @@ impl Page {
         out
     }
 
+    /// Reset the page in place to an empty, zeroed page with a valid header,
+    /// reusing the existing buffer. Used to recycle a frame for a new page
+    /// without allocating.
+    pub(crate) fn reset(&mut self) {
+        let bytes = self.buf.as_mut_slice();
+        bytes.fill(0);
+        write_u32(bytes, OFF_MAGIC, MAGIC);
+        write_u16(bytes, OFF_VERSION, FORMAT_VERSION);
+    }
+
     /// Stamp the slot id into the header and recompute the checksum.
     pub(crate) fn stamp(&mut self, id: PageId) {
         {

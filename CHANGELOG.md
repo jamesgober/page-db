@@ -8,6 +8,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-05
+
+The buffer pool: a bounded in-memory cache of pages over the file, with pinning
+and dirty tracking, so hot pages stay resident and the engine above asks for a
+page by id and gets back a pinned frame. Purely additive — the v0.2.0 page and
+file API is unchanged.
+
+### Added
+
+- `BufferPool<S = PageFile>` &mdash; a bounded frame cache over a `PageStore`,
+  with `new`, `open` (convenience over a `PageFile`), `fetch`, `new_page`,
+  `flush`, `flush_all`, `checkpoint`, `sync`, and the introspection helpers
+  `capacity`, `resident_len`, `is_resident`. Clock (second-chance) eviction;
+  every method takes `&self`, so the pool is shared across threads.
+- `PageGuard` &mdash; an RAII pin on a cached page (`read`, `write`, `id`,
+  `is_dirty`); the page stays resident while a guard is alive, and a write marks
+  it dirty. `PageRef` / `PageMut` are the read/write borrows, dereferencing to
+  `Page`.
+- `PageStore` &mdash; the storage seam the pool sits on (`page_size`,
+  `allocate_page`, `read_into`, `write_page`, `sync`), implemented by `PageFile`.
+- `PageFile::read_into` &mdash; the zero-allocation read that lets the pool
+  recycle a frame buffer on a cache miss.
+- `PageError::BufferPoolExhausted` &mdash; returned when every frame is pinned,
+  rather than evicting a pinned page.
+
+### Testing
+
+- Property test: through any sequence of fetches and dirtying writes against a
+  pool smaller than the working set, every page always reads back its last
+  written value &mdash; nothing is lost to eviction.
+- `loom` model checks for the two concurrency invariants: a pinned page is never
+  evicted, and an evicted dirty page is always flushed first.
+- Criterion benchmarks for the cache hit path and the miss/eviction path.
+
+### Notes
+
+- For v0.3.0 the pool serializes its bookkeeping and miss-path I/O under a single
+  mutex; sharding to remove the single-lock bottleneck is a later, measured
+  change behind the same API.
+
 ## [0.2.0] - 2026-06-05
 
 The first working release: the page format and the durable file underneath it.
@@ -66,6 +106,7 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` (Node 24 actions; fmt, clippy, test, doc, audit, deny) and `.github/FUNDING.yml`.
 
 <!-- LINKS -->
-[Unreleased]: https://github.com/jamesgober/page-db/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/page-db/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/page-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/page-db/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/page-db/releases/tag/v0.1.0

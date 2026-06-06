@@ -15,9 +15,9 @@
 <br>
 
 > Complete reference for every public item in `page-db`, with examples.
-> **Status: pre-1.0.** The surface below is what ships in `v0.2.0` — the page
-> format and the Direct I/O file. The LRU buffer pool, pinning, and the page
-> allocator land across the rest of the 0.x series (see
+> **Status: pre-1.0.** The surface below is what ships in `v0.3.0` — the page
+> format, the Direct I/O file, and the buffer pool. The page allocator (a
+> free-list over the file) is the remaining 0.x piece (see
 > [`dev/ROADMAP.md`](../dev/ROADMAP.md)); the public API is frozen at `1.0.0`.
 
 ## Table of Contents
@@ -33,6 +33,9 @@
   - [`Page`](#page)
   - [`PageFile`](#pagefile)
   - [`PageFileOptions`](#pagefileoptions)
+  - [`BufferPool`](#bufferpool)
+  - [`PageGuard`, `PageRef`, `PageMut`](#pageguard-pageref-pagemut)
+  - [`PageStore`](#pagestore)
   - [`PageError` & `PageResult`](#pageerror--pageresult)
   - [`checksum` — CRC32C](#checksum--crc32c)
 - [Feature Flags](#feature-flags)
@@ -44,14 +47,14 @@
 
 ```toml
 [dependencies]
-page-db = "0.2"
+page-db = "0.3"
 ```
 
 With serde derives on the small value types:
 
 ```toml
 [dependencies]
-page-db = { version = "0.2", features = ["serde"] }
+page-db = { version = "0.3", features = ["serde"] }
 ```
 
 MSRV: Rust 1.85 (2024 edition).
@@ -102,6 +105,15 @@ before returning — a corrupt or misdirected page is a typed
 
 Durability is two explicit steps: [`write_page`](#pagefile) places bytes,
 [`sync`](#pagefile) makes them durable. Write many pages, then sync once.
+
+A [`BufferPool`](#bufferpool) sits on top of the file (or any
+[`PageStore`](#pagestore)). It keeps a bounded set of pages resident in frames.
+A [`fetch`](#bufferpool) returns a [`PageGuard`](#pageguard-pageref-pagemut)
+that **pins** the page — a pinned page is never evicted — and dropping the guard
+unpins it. Writing through the guard marks the page **dirty**, and a dirty page
+is always flushed to the store before its frame is reused. When every frame is
+pinned, the pool returns [`BufferPoolExhausted`](#pageerror--pageresult) rather
+than evict something it must not.
 
 <br>
 
@@ -438,6 +450,161 @@ assert!(result.is_err());    // the file does not exist
 
 <br>
 
+### `BufferPool`
+
+A bounded cache of pages over a [`PageStore`](#pagestore). `BufferPool<S>` is
+generic over its backing store; the default is [`PageFile`](#pagefile), so
+`BufferPool` with no type parameter is a pool over a file. It is `Send + Sync`
+and every method takes `&self`.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `open` | `fn open<P: AsRef<Path>>(path: P, page_size: PageSize, capacity: usize) -> PageResult<BufferPool<PageFile>>` | Open a file and wrap it in a pool of `capacity` frames. |
+| `new` | `fn new(store: S, capacity: usize) -> BufferPool<S>` | Build a pool over any store. |
+| `capacity` | `fn capacity(&self) -> usize` | Number of frames. |
+| `resident_len` | `fn resident_len(&self) -> usize` | Number of pages currently resident. |
+| `is_resident` | `fn is_resident(&self, id: PageId) -> bool` | Whether `id` is held in the pool. |
+| `fetch` | `fn fetch(&self, id: PageId) -> PageResult<PageGuard>` | Pin and return the page at `id` (read on miss). |
+| `new_page` | `fn new_page(&self, id: PageId) -> PageResult<PageGuard>` | Pin a fresh zeroed dirty page at `id` (no read). |
+| `flush` | `fn flush(&self, id: PageId) -> PageResult<()>` | Write `id` to the store if resident and dirty. |
+| `flush_all` | `fn flush_all(&self) -> PageResult<()>` | Write every dirty resident page. |
+| `checkpoint` | `fn checkpoint(&self) -> PageResult<()>` | `flush_all` then `sync`. |
+| `sync` | `fn sync(&self) -> PageResult<()>` | Make the store durable. |
+
+**Parameters.**
+
+- `open` / `new` — `capacity` is the number of frames held resident, clamped up
+  to at least one. Frame buffers are allocated once; the pool does no
+  per-request allocation.
+- `fetch` — `id` is the page to pin. Served from cache if resident; otherwise a
+  frame is reused (a dirty victim is flushed first) and the page is read in.
+- `new_page` — `id` is the slot to create. The page is zeroed, marked dirty, and
+  pinned; no read happens. The caller chooses the id (a free-list allocator is a
+  later release). If `id` is already resident it is reset to blank.
+
+**Errors.** `fetch` and `new_page` return
+[`BufferPoolExhausted`](#pageerror--pageresult) when every frame is pinned;
+`fetch` also surfaces the store's read errors (e.g.
+[`ShortRead`](#pageerror--pageresult) for an unwritten slot). Flushing surfaces
+the store's write errors.
+
+**Create, write, checkpoint, fetch.**
+
+```rust
+use page_db::{BufferPool, PageId, Lsn, DEFAULT_PAGE_SIZE};
+
+# let dir = tempfile::tempdir().unwrap();
+# let path = dir.path().join("data.pages");
+let pool = BufferPool::open(&path, DEFAULT_PAGE_SIZE, 128)?;
+
+// Create page 0 and write to it; the write marks the frame dirty.
+{
+    let guard = pool.new_page(PageId::new(0))?;
+    let mut page = guard.write();
+    page.set_lsn(Lsn::new(1));
+    page.payload_mut()[..5].copy_from_slice(b"hello");
+}   // guard dropped: page 0 unpinned, still resident and dirty
+
+pool.checkpoint()?;   // flush dirty frames, then make the file durable
+
+// Fetch it back — a cache hit, served without I/O.
+let guard = pool.fetch(PageId::new(0))?;
+assert_eq!(guard.read().lsn(), Lsn::new(1));
+assert_eq!(&guard.read().payload()[..5], b"hello");
+# Ok::<(), page_db::PageError>(())
+```
+
+**Pinning blocks eviction.** While a guard is held, its page cannot be evicted;
+if the whole pool is pinned, admission fails instead of evicting.
+
+```rust
+use page_db::{BufferPool, PageId, PageError, DEFAULT_PAGE_SIZE};
+
+# let dir = tempfile::tempdir().unwrap();
+# let path = dir.path().join("data.pages");
+let pool = BufferPool::open(&path, DEFAULT_PAGE_SIZE, 1)?;   // one frame
+let held = pool.new_page(PageId::new(0))?;                   // pin it
+
+assert!(matches!(
+    pool.new_page(PageId::new(1)),
+    Err(PageError::BufferPoolExhausted { capacity: 1 })
+));
+assert!(pool.is_resident(PageId::new(0)));
+drop(held);                                                  // now a frame is free
+# Ok::<(), page_db::PageError>(())
+```
+
+<br>
+
+### `PageGuard`, `PageRef`, `PageMut`
+
+`PageGuard` is the pin returned by [`fetch`](#bufferpool) /
+[`new_page`](#bufferpool). The page stays resident while the guard is alive;
+dropping it releases the pin.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `id` | `fn id(&self) -> PageId` | The pinned page's id. |
+| `is_dirty` | `fn is_dirty(&self) -> bool` | Whether the page has unflushed changes. |
+| `read` | `fn read(&self) -> PageRef<'_>` | Shared read borrow (concurrent readers allowed). |
+| `write` | `fn write(&self) -> PageMut<'_>` | Exclusive write borrow; marks the page dirty. |
+
+`PageRef` dereferences to [`Page`](#page) (read-only); `PageMut` dereferences to
+`Page` mutably. Keep these borrows short — they hold the frame's lock.
+
+```rust
+use page_db::{BufferPool, PageId, Lsn, DEFAULT_PAGE_SIZE};
+
+# let dir = tempfile::tempdir().unwrap();
+# let path = dir.path().join("data.pages");
+let pool = BufferPool::open(&path, DEFAULT_PAGE_SIZE, 16)?;
+let guard = pool.new_page(PageId::new(0))?;
+
+// Write borrow — marks dirty.
+{
+    let mut page = guard.write();
+    page.set_lsn(Lsn::new(7));
+    page.payload_mut()[0] = 0xAB;
+}
+assert!(guard.is_dirty());
+
+// Read borrow.
+assert_eq!(guard.read().payload()[0], 0xAB);
+assert_eq!(guard.id(), PageId::new(0));
+# Ok::<(), page_db::PageError>(())
+```
+
+<br>
+
+### `PageStore`
+
+The storage seam the buffer pool sits on. [`PageFile`](#pagefile) implements it;
+the pool is written against the trait so it can be driven by an in-memory store
+in tests or an alternative backend later. Most users never name this trait —
+they pass a `PageFile` to [`BufferPool::open`](#bufferpool).
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `page_size` | `fn page_size(&self) -> usize` | The store's page size. |
+| `allocate_page` | `fn allocate_page(&self) -> Page` | A blank page of the right size. |
+| `read_into` | `fn read_into(&self, id: PageId, page: &mut Page) -> PageResult<()>` | Read `id` into `page`, verifying it. |
+| `write_page` | `fn write_page(&self, id: PageId, page: &mut Page) -> PageResult<()>` | Write `page` to `id` (stamps id + checksum). |
+| `sync` | `fn sync(&self) -> PageResult<()>` | Flush to durability. |
+
+```rust
+use page_db::{BufferPool, PageFile, PageId, DEFAULT_PAGE_SIZE};
+
+# let dir = tempfile::tempdir().unwrap();
+# let path = dir.path().join("data.pages");
+// PageFile is a PageStore, so it backs a pool directly.
+let file = PageFile::open(&path, DEFAULT_PAGE_SIZE)?;
+let pool = BufferPool::new(file, 64);
+let _ = pool.new_page(PageId::new(0))?;
+# Ok::<(), page_db::PageError>(())
+```
+
+<br>
+
 ### `PageError` & `PageResult`
 
 `PageResult<T>` is `Result<T, PageError>`. `PageError` is `#[non_exhaustive]`;
@@ -452,6 +619,7 @@ match with a wildcard arm.
 | `ChecksumMismatch { page_id, stored, computed }` | The page is corrupt (torn write, bit rot). | Treat the page as lost; recover from the log or a replica. |
 | `MisdirectedPage { requested, found }` | The slot holds a page stamped with a different id. | A misdirected read/write — surface as corruption. |
 | `ShortRead { page_id, got, page_size }` | The slot is past end-of-file, or the file is not a whole number of pages. | Allocate the slot first, or check `page_count`. |
+| `BufferPoolExhausted { capacity }` | Every frame in a [`BufferPool`](#bufferpool) is pinned. | Release some [`PageGuard`](#pageguard-pageref-pagemut)s, or size the pool larger. |
 
 ```rust
 use page_db::{PageFile, PageId, PageError, DEFAULT_PAGE_SIZE};
@@ -536,9 +704,12 @@ The crate is `std`-only: a file-backed, Direct-I/O page store is inherently
 - **Direct I/O alignment** is handled for you: page buffers are aligned to the
   page size, which satisfies the block-alignment rules on every supported
   platform for page sizes of 4 KiB and up.
-- **Thread safety.** `PageFile`, `Page`, `PageId`, and `Lsn` are `Send + Sync`.
-  Concurrent positioned reads and writes do not contend on a shared cursor; the
-  caller is responsible for not writing the same slot from two threads at once.
+- **Thread safety.** `PageFile`, `BufferPool`, `Page`, `PageId`, and `Lsn` are
+  `Send + Sync`. `PageFile`'s concurrent positioned reads and writes do not
+  contend on a shared cursor; the caller is responsible for not writing the same
+  slot from two threads at once. `BufferPool` is internally synchronized — its
+  pin/evict/dirty invariants are verified under `loom` — so it is shared across
+  threads behind an `Arc` directly.
 
 ---
 

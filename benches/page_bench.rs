@@ -6,7 +6,7 @@
 //! barrier dominating every sample; `sync` is measured separately.
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use page_db::{Lsn, PageFileOptions, PageId, crc32c};
+use page_db::{BufferPool, Lsn, PageFileOptions, PageId, crc32c};
 
 fn bench_crc32c(c: &mut Criterion) {
     let mut group = c.benchmark_group("crc32c");
@@ -72,6 +72,54 @@ fn bench_write_sync(c: &mut Criterion) {
     });
 }
 
+fn bench_pool_hit(c: &mut Criterion) {
+    let file = PageFileOptions::new()
+        .direct_io(false)
+        .open(temp_path("pool-hit"))
+        .expect("open");
+    let pool = BufferPool::new(file, 16);
+    {
+        let guard = pool.new_page(PageId::new(0)).expect("new_page");
+        guard.write().payload_mut().fill(0x11);
+    }
+    pool.flush_all().expect("flush");
+
+    // The page is resident, so every fetch is a cache hit: no I/O, just the
+    // lookup, pin, and read borrow.
+    let _ = c.bench_function("pool_fetch_hit", |b| {
+        b.iter(|| {
+            let guard = pool.fetch(black_box(PageId::new(0))).expect("fetch");
+            black_box(guard.read().payload()[0]);
+        });
+    });
+}
+
+fn bench_pool_miss(c: &mut Criterion) {
+    let file = PageFileOptions::new()
+        .direct_io(false)
+        .open(temp_path("pool-miss"))
+        .expect("open");
+    // More pages than frames, so cycling through them forces an eviction and a
+    // read on every fetch.
+    let pages = 32u64;
+    let pool = BufferPool::new(file, 4);
+    for id in 0..pages {
+        let guard = pool.new_page(PageId::new(id)).expect("new_page");
+        let _ = guard;
+    }
+    pool.flush_all().expect("flush");
+
+    let mut next = 0u64;
+    let _ = c.bench_function("pool_fetch_miss_evict", |b| {
+        b.iter(|| {
+            let id = PageId::new(next % pages);
+            next = next.wrapping_add(7); // stride to defeat the small cache
+            let guard = pool.fetch(black_box(id)).expect("fetch");
+            black_box(guard.read().payload()[0]);
+        });
+    });
+}
+
 fn temp_path(tag: &str) -> std::path::PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!("page-db-bench-{tag}-{}.pages", std::process::id()));
@@ -83,6 +131,8 @@ criterion_group!(
     bench_crc32c,
     bench_stamp,
     bench_read,
-    bench_write_sync
+    bench_write_sync,
+    bench_pool_hit,
+    bench_pool_miss
 );
 criterion_main!(benches);
