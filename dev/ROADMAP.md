@@ -39,10 +39,16 @@ Exit criteria:
 
 ---
 
-## v0.5.0 -- torn-page / corruption fuzzing + alignment edge cases + API freeze
+## v0.5.0 -- torn-page / corruption fuzzing + alignment edge cases + API freeze (DONE)
 
 Exit criteria:
-- [ ] Public API frozen (recorded here). `cargo audit` + `cargo deny` clean.
+- [x] **Public API frozen.** No additions before 1.0 -- only bug fixes and the
+  on-disk-format freeze. Frozen surface: `PageFile`/`PageFileOptions`,
+  `BufferPool`/`PageGuard`/`PageRef`/`PageMut`, `PageAllocator`, `PageStore`,
+  `Page`, `PageId`/`Lsn`/`PageSize`, `PageError`/`PageResult`, `checksum`.
+- [x] `cargo audit` + `cargo deny` clean.
+- [x] Parse + recovery paths fuzzed (`fuzz/`: `page_parse`, `allocator_open`).
+  Fuzzing fixed a corrupt-superblock DoS in the free-chain walk.
 
 ---
 

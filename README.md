@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Fixed-size pages. CRC32C + LSN headers. Cross-platform Direct I/O.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, feature-frozen.</strong> As of <code>v0.4.0</code> the page format, the durable Direct I/O file, the LRU buffer pool with pinning and dirty tracking, and the page-id allocator are all implemented, and the public API is frozen for 1.0. Remaining 0.x work is hardening (fuzzing, alignment edge cases) per <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. The on-disk format is unstable until 1.0.
+        <strong>Status: pre-1.0, API frozen.</strong> As of <code>v0.5.0</code> the page format, the durable Direct I/O file, the LRU buffer pool with pinning and dirty tracking, and the page-id allocator are all implemented; the parse and recovery paths are fuzzed, and the public API is frozen for 1.0. The remaining road to 1.0 is integration soak and the on-disk-format freeze per <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. The on-disk format is unstable until 1.0.
     </blockquote>
 </div>
 
@@ -54,7 +54,7 @@
 
 ```toml
 [dependencies]
-page-db = "0.4"
+page-db = "0.5"
 ```
 
 <br>

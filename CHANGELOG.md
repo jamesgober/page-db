@@ -8,6 +8,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-05
+
+Hardening and the **formal API freeze**. Fuzzing the parse and recovery paths
+surfaced — and this release fixes — a denial-of-service on a corrupt allocator
+superblock; the public API is now frozen for 1.0. No API changes.
+
+### Security
+
+- **Hardened the free-list chain walk against a corrupt superblock.** Opening an
+  allocator now rejects a free-list that cycles, points outside the allocated id
+  range, or disagrees with its recorded count, with `InvalidSuperblock` —
+  previously a crafted superblock with a cycle and a large free count could drive
+  an unbounded walk. The walk is bounded by the recorded count, validates every
+  link is a real allocated id, and detects cycles, so its time and memory are
+  bounded by the pages that actually exist.
+
+### Added
+
+- A `fuzz/` harness (standalone cargo-fuzz crate) with two targets: `page_parse`
+  feeds arbitrary bytes to `Page::from_bytes` and `crc32c`; `allocator_open`
+  feeds an adversarial superblock and free-list to `PageAllocator::new`. Both run
+  clean (millions of executions, no panic, hang, or over-allocation).
+- Alignment edge-case tests: `PageSize` accepts exactly the powers of two in
+  range and rejects the boundaries; every accepted size round-trips in memory and
+  through the file at a page-aligned offset.
+
+### Notes
+
+- **API freeze.** The public API is frozen for 1.0; no further additions before
+  1.0, only bug fixes and the on-disk-format freeze. `cargo audit` and
+  `cargo deny check` are clean.
+- The on-disk format remains unstable across 0.x and is frozen for 1.x before
+  1.0.
+
 ## [0.4.0] - 2026-06-05
 
 The page allocator and the **feature freeze**. An id-space allocator over the
@@ -144,7 +178,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` (Node 24 actions; fmt, clippy, test, doc, audit, deny) and `.github/FUNDING.yml`.
 
 <!-- LINKS -->
-[Unreleased]: https://github.com/jamesgober/page-db/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/page-db/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/page-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/page-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/page-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/page-db/compare/v0.1.0...v0.2.0

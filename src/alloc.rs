@@ -22,6 +22,7 @@
 //! authority on crash recovery; the superblock is a checkpoint of allocator
 //! state.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::error::{PageError, PageResult};
@@ -131,7 +132,10 @@ impl<S: PageStore> PageAllocator<S> {
                 let head = read_u64(payload, SB_HEAD_OFF);
                 let next_new = read_u64(payload, SB_NEXT_OFF);
                 let free_count = read_u64(payload, SB_FREECOUNT_OFF);
-                let free_list = walk_free_chain(&store, &mut scratch, head, free_count)?;
+                if next_new < 1 {
+                    return Err(PageError::InvalidSuperblock);
+                }
+                let free_list = walk_free_chain(&store, &mut scratch, head, next_new, free_count)?;
                 (free_list, next_new, false)
             }
             // No page 0 yet: a fresh file. Reserve page 0 for the superblock and
@@ -273,24 +277,45 @@ impl<S: PageStore> PageAllocator<S> {
 
 /// Follow the on-disk free-list chain from `head`, returning the ids in the same
 /// order [`persist_superblock`](PageAllocator::persist_superblock) wrote them.
+///
+/// This walks an untrusted, possibly corrupt superblock, so it is bounded
+/// against a malicious chain: every link must be a real allocated id
+/// (`1..next_new`), no id may repeat (a cycle is rejected, not followed), the
+/// walk never collects more than `free_count` ids, and the final length must
+/// match `free_count` exactly. Any deviation is [`PageError::InvalidSuperblock`].
 fn walk_free_chain<S: PageStore>(
     store: &S,
     scratch: &mut Page,
     head: u64,
+    next_new: u64,
     free_count: u64,
 ) -> PageResult<Vec<u64>> {
     let mut ids = Vec::new();
+    let mut seen = HashSet::new();
     let mut cur = head;
-    for _ in 0..free_count {
-        if cur == NO_PAGE {
+
+    while cur != NO_PAGE {
+        // Never collect more links than the superblock claims, so a corrupt
+        // count can never drive an unbounded walk.
+        if ids.len() as u64 >= free_count {
+            return Err(PageError::InvalidSuperblock);
+        }
+        // Every free id must be a real allocated page (page 0 is reserved).
+        if cur == 0 || cur >= next_new {
+            return Err(PageError::InvalidSuperblock);
+        }
+        // A repeat means the chain cycles; reject rather than loop. `seen` grows
+        // only to the number of distinct existing pages, so it cannot run away.
+        if !seen.insert(cur) {
             return Err(PageError::InvalidSuperblock);
         }
         ids.push(cur);
         store.read_into(PageId::new(cur), scratch)?;
         cur = read_u64(scratch.payload(), LINK_NEXT_OFF);
     }
+
     // The chain must end exactly at the recorded length.
-    if cur != NO_PAGE {
+    if ids.len() as u64 != free_count {
         return Err(PageError::InvalidSuperblock);
     }
     Ok(ids)
@@ -432,6 +457,58 @@ mod tests {
             page.payload_mut()[0] = 0xFF;
             store.write_page(PageId::new(0), &mut page).unwrap();
         }
+        assert!(matches!(
+            PageAllocator::new(store),
+            Err(PageError::InvalidSuperblock)
+        ));
+    }
+
+    /// Write a raw superblock (no consistency checks) to drive the corrupt-input
+    /// rejection tests.
+    fn write_superblock(store: &MemStore, head: u64, next_new: u64, free_count: u64) {
+        let mut page = store.allocate_page();
+        let payload = page.payload_mut();
+        write_u32(payload, SB_MAGIC_OFF, SB_MAGIC);
+        write_u16(payload, SB_VERSION_OFF, SB_VERSION);
+        write_u64(payload, SB_HEAD_OFF, head);
+        write_u64(payload, SB_NEXT_OFF, next_new);
+        write_u64(payload, SB_FREECOUNT_OFF, free_count);
+        store.write_page(PageId::new(0), &mut page).unwrap();
+    }
+
+    fn write_link(store: &MemStore, id: u64, next: u64) {
+        let mut page = store.allocate_page();
+        write_u64(page.payload_mut(), LINK_NEXT_OFF, next);
+        store.write_page(PageId::new(id), &mut page).unwrap();
+    }
+
+    #[test]
+    fn test_new_rejects_cycled_free_chain() {
+        let store = MemStore::new(PS);
+        write_superblock(&store, 1, 3, 10); // claims 10 free in id space 1..3
+        write_link(&store, 1, 2);
+        write_link(&store, 2, 1); // 1 -> 2 -> 1 cycles
+        assert!(matches!(
+            PageAllocator::new(store),
+            Err(PageError::InvalidSuperblock)
+        ));
+    }
+
+    #[test]
+    fn test_new_rejects_out_of_range_link() {
+        let store = MemStore::new(PS);
+        write_superblock(&store, 5, 3, 1); // head 5 is past the high-water mark
+        assert!(matches!(
+            PageAllocator::new(store),
+            Err(PageError::InvalidSuperblock)
+        ));
+    }
+
+    #[test]
+    fn test_new_rejects_free_count_mismatch() {
+        let store = MemStore::new(PS);
+        write_superblock(&store, 1, 3, 5); // claims 5 free
+        write_link(&store, 1, NO_PAGE); // chain is only 1 long
         assert!(matches!(
             PageAllocator::new(store),
             Err(PageError::InvalidSuperblock)
