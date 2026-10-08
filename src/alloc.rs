@@ -35,7 +35,7 @@ use crate::sync::{self, Mutex};
 const NO_PAGE: u64 = u64::MAX;
 
 /// Superblock magic: `b"PGSB"`.
-const SB_MAGIC: u32 = u32::from_le_bytes([b'P', b'G', b'S', b'B']);
+const SB_MAGIC: u32 = u32::from_le_bytes(*b"PGSB");
 const SB_VERSION: u16 = 1;
 
 // Superblock field offsets within the page payload.

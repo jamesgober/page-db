@@ -38,7 +38,7 @@ pub const PAGE_HEADER_SIZE: usize = 32;
 /// The default page size (4 KiB), matching the common OS and device page size.
 pub const DEFAULT_PAGE_SIZE: PageSize = PageSize(4096);
 
-const MAGIC: u32 = u32::from_le_bytes([b'P', b'G', b'D', b'B']);
+const MAGIC: u32 = u32::from_le_bytes(*b"PGDB");
 const FORMAT_VERSION: u16 = 1;
 
 const OFF_MAGIC: usize = 0;
