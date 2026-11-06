@@ -166,7 +166,7 @@ See also the [On-Disk Format](./docs/ON_DISK_FORMAT.md) (the bytes page-db write
 - [`wal-db`](https://github.com/jamesgober/wal-db) &mdash; the LSN slot in each page header coordinates with the write-ahead log
 - heap / B-tree engines &mdash; any storage engine that needs durable, cached, fixed-size pages
 
-It depends on no sibling crates &mdash; only `thiserror` (error types) and, on Unix, `libc` (for `O_DIRECT` and the macOS durability syscalls) &mdash; so it builds and tests standalone today.
+It depends on no sibling crates &mdash; only `define-err` (error types; it has no dependencies of its own) and, on Unix, `libc` (for `O_DIRECT` and the macOS durability syscalls) &mdash; so it builds and tests standalone today.
 
 <br>
 
