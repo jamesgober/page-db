@@ -76,7 +76,7 @@ serde = ["dep:serde"]
 [dependencies]
 # Typed, source-preserving error variants, declared with a declarative macro:
 # no proc macro and no build dependency.
-define-err = "0.7"
+define-err = "0.8"
 serde = { version = "1", optional = true, default-features = false, features = ["derive"] }
 
 # O_DIRECT, F_NOCACHE, and F_FULLFSYNC are not exposed by std; libc is the
