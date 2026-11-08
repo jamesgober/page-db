@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- `PageError` is declared with `define-err` instead of `thiserror`: no proc
+  macro and no build dependency. Its variants, fields, `Display` and `Debug`
+  text, `source()`, and `From<std::io::Error>` are unchanged, and
+  `cargo semver-checks` against 1.0.0 finds nothing to bump. `PageError` also
+  implements `define_err::ErrorInfo`, with the defaults: no code, severity
+  `ERROR`, category `Unknown`.
+
 ## [1.0.0] - 2026-06-06
 
 **The first stable release.** The public API is frozen until 2.0 and the on-disk
