@@ -69,11 +69,28 @@ impl PageId {
         self.0
     }
 
-    /// The byte offset of this page in a file of the given page size.
+    /// The byte offset of this page in a file of the given page size, or
+    /// `None` if the page (its first or its last byte) lies beyond what a
+    /// 64-bit file offset can address.
     #[inline]
     #[must_use]
-    pub(crate) const fn byte_offset(self, page_size: usize) -> u64 {
-        self.0 * page_size as u64
+    pub(crate) const fn byte_offset(self, page_size: usize) -> Option<u64> {
+        let size = page_size as u64;
+        match self.0.checked_mul(size) {
+            Some(start) => match start.checked_add(size) {
+                Some(_) => Some(start),
+                None => None,
+            },
+            None => None,
+        }
+    }
+
+    /// The number of page ids a file of `page_size` pages can address: every id
+    /// below this has a representable byte range.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn addressable(page_size: usize) -> u64 {
+        u64::MAX / page_size as u64
     }
 }
 

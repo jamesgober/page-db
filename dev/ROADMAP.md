@@ -66,6 +66,23 @@ Exit criteria:
 
 ---
 
+## v1.1.0 -- Review fixes (DONE)
+
+Fixes from an independent review of 1.0.0, with no breaking change and no
+on-disk break: the lost write on a flush/write overlap, the checkpoint deadlock
+with latch coupling, the write-ahead rule on eviction (`LogWatermark`), the
+allocator's double free, and the torn-superblock and link-ordering failures
+(two checksummed superblock copies in page 0). Also: offset overflow, sticky
+sync failures, the new file's directory entry, `BufferPool::discard`, and
+incremental free-list link writes.
+
+Still open from the review, for a later 1.x: fetch misses and eviction writes
+run under the pool mutex (moving that I/O out needs a loading state per frame);
+the CRC is software only; `PageStore` cannot stamp or verify a page from outside
+the crate.
+
+---
+
 ## Out of scope for 1.0
 
 - B+tree or heap logic - that lives in `index-db` and the engines above.

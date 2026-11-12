@@ -120,10 +120,11 @@ pub enum PageError {
         capacity: usize,
     },
 
-    /// An id handed to the allocator's `free` is not one it could have
-    /// allocated: it is the reserved superblock (page 0), or it is beyond the
-    /// high-water mark of pages ever allocated.
-    #[error("invalid page id to free: {page_id}")]
+    /// A page id that cannot be used here: an id handed to the allocator's
+    /// `free` that is the reserved superblock (page 0), is beyond the high-water
+    /// mark of pages ever allocated, or is already free; or an id whose byte
+    /// offset does not fit in a 64-bit file offset.
+    #[error("invalid page id: {page_id}")]
     InvalidPageId {
         /// The rejected id.
         page_id: u64,
@@ -133,4 +134,19 @@ pub enum PageError {
     /// initialized by the allocator, or its superblock is corrupt.
     #[error("page 0 is not a valid allocator superblock")]
     InvalidSuperblock,
+
+    /// A buffer-pool operation that needs an unpinned page found it pinned: a
+    /// [`PageGuard`](crate::PageGuard) for it is still alive.
+    #[error("page {page_id} is pinned")]
+    PagePinned {
+        /// The pinned page.
+        page_id: u64,
+    },
+}
+
+/// The error every sync returns once one sync on the same handle has failed.
+pub(crate) fn sync_poisoned() -> PageError {
+    PageError::Io(io::Error::other(
+        "an earlier sync failed on this handle; reopen and recover from the log",
+    ))
 }

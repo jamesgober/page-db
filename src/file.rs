@@ -1,9 +1,11 @@
 //! [`PageFile`]: a file of fixed-size pages, read and written through Direct I/O.
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::error::{PageError, PageResult};
+use crate::error::{PageError, PageResult, sync_poisoned};
 use crate::page::{DEFAULT_PAGE_SIZE, Page, PageId, PageSize};
 use crate::sys;
 
@@ -83,10 +85,13 @@ impl PageFileOptions {
     /// Returns [`PageError::Io`] if the file cannot be opened (including a
     /// filesystem that rejects Direct I/O, surfaced as the OS error).
     pub fn open<P: AsRef<Path>>(self, path: P) -> PageResult<PageFile> {
-        let file = sys::open(path.as_ref(), self.direct_io, self.create)?;
+        let path = path.as_ref();
+        let (file, created) = sys::open(path, self.direct_io, self.create)?;
         Ok(PageFile {
             file,
             page_size: self.page_size,
+            sync_failed: AtomicBool::new(false),
+            new_entry: Mutex::new(created.then(|| path.to_path_buf())),
         })
     }
 }
@@ -101,7 +106,11 @@ impl PageFileOptions {
 ///
 /// Durability is two steps, deliberately: [`write_page`](PageFile::write_page)
 /// places bytes, and [`sync`](PageFile::sync) makes them durable. Batch many
-/// writes, then sync once.
+/// writes, then sync once. When `open` creates the file, the first successful
+/// `sync` also flushes the parent directory on Unix, so the file's name is as
+/// durable as its pages. A failed `sync` is permanent for the handle: every
+/// later `sync` fails too, because the pages it covered may already be gone from
+/// the OS cache. Reopen the file and recover from the log.
 ///
 /// # Examples
 ///
@@ -127,6 +136,11 @@ impl PageFileOptions {
 pub struct PageFile {
     file: File,
     page_size: PageSize,
+    /// Set once a sync has failed; every later sync then fails as well.
+    sync_failed: AtomicBool,
+    /// The path of a file this handle created, until the first successful sync
+    /// has made its directory entry durable.
+    new_entry: Mutex<Option<PathBuf>>,
 }
 
 impl PageFile {
@@ -168,6 +182,14 @@ impl PageFile {
         Page::new(self.page_size)
     }
 
+    /// The byte offset of slot `id`, or [`PageError::InvalidPageId`] if the slot
+    /// lies beyond what a 64-bit file offset can address.
+    #[inline]
+    fn offset_of(&self, id: PageId) -> PageResult<u64> {
+        id.byte_offset(self.page_size.get())
+            .ok_or(PageError::InvalidPageId { page_id: id.get() })
+    }
+
     /// Read the page at slot `id`, verifying its header and checksum.
     ///
     /// The page's magic, version, and CRC32C are checked, and its stamped id is
@@ -180,6 +202,8 @@ impl PageFile {
     /// - [`PageError::BadMagic`] / [`PageError::UnsupportedVersion`] /
     ///   [`PageError::ChecksumMismatch`] / [`PageError::MisdirectedPage`] if the
     ///   page fails validation.
+    /// - [`PageError::InvalidPageId`] if the slot's byte offset does not fit in
+    ///   a 64-bit file offset.
     /// - [`PageError::Io`] on an I/O failure.
     pub fn read_page(&self, id: PageId) -> PageResult<Page> {
         let mut page = Page::new(self.page_size);
@@ -198,13 +222,14 @@ impl PageFile {
     ///
     /// As [`read_page`](PageFile::read_page), plus
     /// [`PageError::InvalidPageSize`] if `page`'s size does not match the file's.
+    /// When validation fails, `page` still holds the bytes that were read.
     pub fn read_into(&self, id: PageId, page: &mut Page) -> PageResult<()> {
         if page.page_size() != self.page_size.get() {
             return Err(PageError::InvalidPageSize {
                 size: page.page_size(),
             });
         }
-        let offset = id.byte_offset(self.page_size.get());
+        let offset = self.offset_of(id)?;
         let got = sys::read_at_full(&self.file, page.as_bytes_mut(), offset)?;
         if got != self.page_size.get() {
             return Err(PageError::ShortRead {
@@ -227,6 +252,8 @@ impl PageFile {
     ///
     /// - [`PageError::InvalidPageSize`] if the page's size does not match the
     ///   file's.
+    /// - [`PageError::InvalidPageId`] if the slot's byte offset does not fit in
+    ///   a 64-bit file offset. Nothing is written.
     /// - [`PageError::Io`] on an I/O failure.
     pub fn write_page(&self, id: PageId, page: &mut Page) -> PageResult<()> {
         if page.page_size() != self.page_size.get() {
@@ -234,23 +261,51 @@ impl PageFile {
                 size: page.page_size(),
             });
         }
+        let offset = self.offset_of(id)?;
         page.stamp(id);
-        let offset = id.byte_offset(self.page_size.get());
         sys::write_all_at(&self.file, page.as_bytes(), offset)?;
         Ok(())
     }
 
     /// Flush all written pages to stable storage.
     ///
-    /// Returns once the data is durable — `fdatasync` on Linux,
-    /// `FlushFileBuffers` on Windows, `F_FULLFSYNC` on macOS.
+    /// Returns once the data is durable: `fdatasync` on Linux,
+    /// `FlushFileBuffers` on Windows, `F_FULLFSYNC` on macOS. If this handle
+    /// created the file, the first successful sync also flushes the parent
+    /// directory on Unix so the file's name survives a power loss.
+    ///
+    /// A failed sync is sticky: the OS may already have dropped the pages it
+    /// could not write, so a retry could report success without them. After the
+    /// first failure every later call returns an error; reopen the file and
+    /// recover from the log.
     ///
     /// # Errors
     ///
-    /// Returns [`PageError::Io`] if the flush fails.
+    /// Returns [`PageError::Io`] if the flush fails, or if an earlier sync on
+    /// this handle failed.
     pub fn sync(&self) -> PageResult<()> {
-        sys::sync_data(&self.file)?;
+        if self.sync_failed.load(Ordering::Acquire) {
+            return Err(sync_poisoned());
+        }
+        if let Err(err) = sys::sync_data(&self.file) {
+            self.sync_failed.store(true, Ordering::Release);
+            return Err(err.into());
+        }
+        let mut entry = match self.new_entry.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(path) = entry.as_deref() {
+            sys::sync_dir(path)?;
+            *entry = None;
+        }
         Ok(())
+    }
+
+    /// Mark this handle as having failed a sync, for tests of the sticky path.
+    #[cfg(test)]
+    pub(crate) fn poison_sync(&self) {
+        self.sync_failed.store(true, Ordering::Release);
     }
 }
 
@@ -346,6 +401,45 @@ mod tests {
             file.read_page(PageId::new(0)),
             Err(PageError::ChecksumMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn test_failed_sync_is_sticky() {
+        let (_dir, path) = temp_file();
+        let file = open_buffered(&path);
+        file.sync().expect("sync");
+        file.poison_sync();
+        assert!(matches!(file.sync(), Err(PageError::Io(_))));
+        assert!(matches!(file.sync(), Err(PageError::Io(_))));
+        // A fresh handle starts clean.
+        drop(file);
+        open_buffered(&path).sync().expect("sync after reopen");
+    }
+
+    #[test]
+    fn test_new_file_entry_is_flushed_once() {
+        let (_dir, path) = temp_file();
+        let file = open_buffered(&path);
+        assert!(file.new_entry.lock().expect("lock").is_some());
+        file.sync().expect("sync");
+        assert!(file.new_entry.lock().expect("lock").is_none());
+        drop(file);
+        // Reopening an existing file has no directory entry to flush.
+        let file = open_buffered(&path);
+        assert!(file.new_entry.lock().expect("lock").is_none());
+    }
+
+    #[test]
+    fn test_huge_id_is_invalid_not_wrapped() {
+        let (_dir, path) = temp_file();
+        let file = open_buffered(&path);
+        let mut page = file.allocate_page();
+        let id = PageId::new(1 << 52);
+        assert!(matches!(
+            file.write_page(id, &mut page),
+            Err(PageError::InvalidPageId { .. })
+        ));
+        assert_eq!(file.page_count().expect("count"), 0);
     }
 
     #[test]

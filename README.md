@@ -18,10 +18,10 @@
 
 <div align="left">
     <p>
-        <strong>page-db</strong> is the <b>paging substrate</b> that sits beneath B-tree and heap storage engines. It owns the unglamorous, get-it-exactly-right layer every database needs: <b>fixed-size pages</b> on disk, each with a header carrying a <b>CRC32</b> integrity check and an <b>LSN slot</b> for write-ahead-log coordination, read and written through <b>cross-platform Direct I/O</b> that bypasses the OS page cache.
+        <strong>page-db</strong> is the <b>paging substrate</b> that sits beneath B-tree and heap storage engines. It owns the unglamorous, get-it-exactly-right layer every database needs: <b>fixed-size pages</b> on disk, each with a header carrying a <b>CRC32C</b> integrity check and an <b>LSN slot</b> for write-ahead-log coordination, read and written through <b>cross-platform Direct I/O</b> that bypasses the OS page cache.
     </p>
     <p>
-        Above the file sits an <b>LRU buffer pool</b> with <b>dirty-page pinning</b>: hot pages stay resident, in-flight pages are pinned against eviction, and dirty pages are flushed on a controlled schedule. The engine above asks for a page by id and gets a pinned, checksummed frame back.
+        Above the file sits a <b>buffer pool</b> with clock eviction and <b>pinning</b>: hot pages stay resident, in-flight pages are pinned against eviction, and a dirty page is written before its frame is reused. With a <b>log watermark</b> installed, the pool never writes a page whose LSN the write-ahead log has not made durable. The engine above asks for a page by id and gets a pinned, checksummed frame back.
     </p>
     <br>
     <hr>
@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Fixed-size pages. CRC32C + LSN headers. Cross-platform Direct I/O.
     </p>
     <blockquote>
-        <strong>Status: stable (<code>v1.0.0</code>).</strong> The page format, the durable Direct I/O file, the LRU buffer pool with pinning and dirty tracking, and the page-id allocator are complete, fuzzed, loom-checked, and stress-tested. The public API is frozen until 2.0, and the <a href="./docs/ON_DISK_FORMAT.md">on-disk format</a> is frozen for the 1.x line — a file written by any 1.x release reads back on any other.
+        <strong>Status: stable (<code>v1.1.0</code>).</strong> The page format, the durable Direct I/O file, the buffer pool with pinning and dirty tracking, and the page-id allocator are complete, fuzzed, loom-checked, and stress-tested. The public API is stable until 2.0 (1.x adds to it, never breaks it), and the <a href="./docs/ON_DISK_FORMAT.md">on-disk format</a> is frozen for the 1.x line: a file written by any 1.x release reads back on any other.
     </blockquote>
 </div>
 
@@ -40,11 +40,12 @@
 
 - **Fixed-size pages** &mdash; configurable page size (4 KiB&ndash;1 MiB); a versioned 32-byte header with magic, CRC32C, page id, and an LSN slot
 - **CRC32C integrity** &mdash; every page is checksummed; a torn, corrupt, or misdirected page is detected on read and returned as a typed error, never silently trusted
-- **Cross-platform Direct I/O** &mdash; O_DIRECT (Linux), F_NOCACHE (macOS), FILE_FLAG_NO_BUFFERING (Windows), into buffers aligned to the page size, with a buffered fallback for filesystems that reject it
+- **Cross-platform Direct I/O** &mdash; O_DIRECT (Linux), F_NOCACHE (macOS), FILE_FLAG_NO_BUFFERING (Windows), into buffers aligned to the page size; on a filesystem that rejects it, open with `direct_io(false)` for buffered I/O
 - **Durable on demand** &mdash; `write_page` places bytes, `sync` makes them durable (fdatasync / FlushFileBuffers / macOS F_FULLFSYNC)
-- **LRU buffer pool** &mdash; a bounded frame cache over the file with clock (second-chance) eviction
-- **Pinning &amp; dirty tracking** &mdash; a pinned page is never evicted; a dirty page is always flushed before its frame is reused &mdash; both verified by property tests and `loom` model checks
-- **Page-id allocator** &mdash; an on-disk free-list that hands out unused ids and reclaims freed ones; `allocate` and `free` are pure in-memory operations
+- **Buffer pool** &mdash; a bounded frame cache over the file with clock (second-chance) eviction
+- **Pinning &amp; dirty tracking** &mdash; a pinned page is never evicted; a dirty page is always flushed before its frame is reused; a write that overlaps a flush is never lost; verified by property tests and `loom` model checks
+- **Write-ahead rule** &mdash; an optional `LogWatermark` keeps any page whose LSN is beyond the log's durable point from reaching disk, forcing the log first when it can
+- **Page-id allocator** &mdash; an on-disk free-list that hands out unused ids and reclaims freed ones; `allocate` and `free` are pure in-memory operations, a double free is refused, and the superblock is kept in two checksummed copies so one torn write cannot make the file unopenable
 
 <br>
 <hr>
@@ -54,7 +55,7 @@
 
 ```toml
 [dependencies]
-page-db = "1.0"
+page-db = "1.1"
 ```
 
 <br>
@@ -113,7 +114,9 @@ fn main() -> Result<(), page_db::PageError> {
 <br>
 
 To put a whole engine layer together, the allocator picks ids and the pool
-caches the pages at them, both over one shared file:
+caches the pages at them, both over one shared file. Discard a page from the
+pool before freeing it, so a stale frame cannot overwrite the free-list link the
+allocator writes into it:
 
 ```rust
 use std::sync::Arc;
@@ -131,6 +134,10 @@ fn main() -> Result<(), page_db::PageError> {
     }
     pool.flush_all()?;
     alloc.sync()?;                       // persist allocator state + page data
+
+    pool.discard(id)?;                   // done with the page: drop its frame
+    alloc.free(id)?;                     // then return the id
+    alloc.sync()?;
     Ok(())
 }
 ```

@@ -2,10 +2,10 @@
 //!
 //! The pool keeps a fixed number of frames resident, each holding one page. A
 //! caller asks for a page by id and gets back a [`PageGuard`] that pins the
-//! frame — a pinned frame is never evicted — and dropping the guard unpins it.
+//! frame (a pinned frame is never evicted), and dropping the guard unpins it.
 //! Writing through the guard marks the frame dirty; a dirty frame is always
-//! flushed to the store before its frame is reused. Those two rules — never
-//! evict a pinned page, never lose a dirty page without flushing — are the
+//! flushed to the store before its frame is reused. Those two rules (never
+//! evict a pinned page, never lose a dirty page without flushing) are the
 //! invariants the property tests and the loom model checks hold the pool to.
 //!
 //! Eviction is the clock (second-chance) algorithm: each frame carries a
@@ -15,18 +15,39 @@
 //! [`PageError::BufferPoolExhausted`] rather than evicting something it must
 //! not.
 //!
-//! For v0.3.0 the pool serializes its bookkeeping — and the miss-path store I/O
-//! — under a single mutex. That keeps the pin/evict/dirty logic small enough to
-//! verify exhaustively with loom; sharding the table to remove the single-lock
-//! bottleneck is a later, measured change behind the same API.
+//! ## Write-ahead rule
+//!
+//! By default the pool writes a dirty page whenever it is flushed or evicted,
+//! whatever its LSN. A database that keeps a write-ahead log installs a
+//! [`LogWatermark`] with [`BufferPool::with_log_watermark`]: the pool then
+//! never writes a page whose LSN is beyond the log's durable point. Eviction
+//! passes over such pages (forcing the log only when nothing else can be
+//! evicted), and a flush forces the log first or leaves the page dirty.
+//!
+//! ## Locking
+//!
+//! The pool's bookkeeping (the id-to-frame map, the free frames, the clock
+//! hand) sits under one mutex, and each frame's page under its own
+//! reader-writer lock. The dirty bit and a frame's resident id change only while
+//! that frame's page lock is held, so a flush and a write are ordered by the
+//! lock and a write can never land on a frame the flush has just marked clean.
+//!
+//! The lock order is: the pool mutex may be held while taking the page lock of
+//! an **unpinned** frame, and a thread holding a page lock (through a
+//! [`PageRef`] or [`PageMut`]) may take the pool mutex, as latch coupling down
+//! a tree does when it fetches a child under the parent's latch. Nothing waits
+//! on the page lock of a pinned frame while holding the pool mutex: flushes
+//! find their targets under the mutex, release it, and only then lock each
+//! page. A miss still reads from the store, and evicts a dirty victim, under the
+//! mutex; moving that I/O out is a later change behind the same API.
 
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
-use crate::error::{PageError, PageResult};
+use crate::error::{PageError, PageResult, sync_poisoned};
 use crate::file::PageFile;
-use crate::page::{Page, PageId, PageSize};
+use crate::page::{Lsn, Page, PageId, PageSize};
 use crate::store::PageStore;
 use crate::sync::{self, Arc, AtomicBool, AtomicU64, AtomicUsize, Mutex, Ordering, RwLock};
 use crate::sync::{RwLockReadGuard, RwLockWriteGuard};
@@ -34,15 +55,91 @@ use crate::sync::{RwLockReadGuard, RwLockWriteGuard};
 /// Sentinel id for a frame that holds no page yet.
 const NO_PAGE: u64 = u64::MAX;
 
+/// The durable point of a write-ahead log, consulted before the pool writes a
+/// page.
+///
+/// The write-ahead rule says a page may reach disk only once the log records up
+/// to its LSN are durable. A pool with a watermark
+/// ([`BufferPool::with_log_watermark`]) reads each dirty page's
+/// [`lsn`](Page::lsn) before writing it, and writes it only if the LSN is at or
+/// below [`durable_lsn`](LogWatermark::durable_lsn). Pages that have never been
+/// logged carry [`Lsn::ZERO`] and are always writable.
+///
+/// Any `Fn() -> Lsn + Send + Sync` closure is a watermark that cannot force the
+/// log. Implement the trait directly to supply [`force`](LogWatermark::force)
+/// as well, so a flush can make the log durable instead of skipping the page.
+///
+/// The pool may call both methods while it holds its own internal locks, so an
+/// implementation must not call back into the pool.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use std::sync::atomic::{AtomicU64, Ordering};
+/// use page_db::{BufferPool, Lsn, PageId, DEFAULT_PAGE_SIZE};
+///
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let path = dir.path().join("data.pages");
+/// // The log's durable end, advanced by whatever syncs the log.
+/// let durable = Arc::new(AtomicU64::new(0));
+/// let seen = Arc::clone(&durable);
+/// let pool = BufferPool::open(&path, DEFAULT_PAGE_SIZE, 64)?
+///     .with_log_watermark(move || Lsn::new(seen.load(Ordering::Acquire)));
+///
+/// {
+///     let guard = pool.new_page(PageId::new(0))?;
+///     guard.write().set_lsn(Lsn::new(10));
+/// }
+/// pool.flush_all()?;                      // LSN 10 is not durable: not written
+/// assert!(pool.fetch(PageId::new(0))?.is_dirty());
+///
+/// durable.store(10, Ordering::Release);   // the log reached LSN 10
+/// pool.flush_all()?;                      // now it is written
+/// assert!(!pool.fetch(PageId::new(0))?.is_dirty());
+/// # Ok::<(), page_db::PageError>(())
+/// ```
+pub trait LogWatermark: Send + Sync {
+    /// The highest LSN whose log record is durable.
+    fn durable_lsn(&self) -> Lsn;
+
+    /// Make the log durable through at least `lsn` if possible, and return the
+    /// durable point afterwards.
+    ///
+    /// The default cannot force the log and returns
+    /// [`durable_lsn`](LogWatermark::durable_lsn) unchanged, so a page beyond it
+    /// is skipped rather than written.
+    ///
+    /// # Errors
+    ///
+    /// Whatever forcing the log returns; the pool passes it to its caller.
+    fn force(&self, lsn: Lsn) -> PageResult<Lsn> {
+        let _ = lsn;
+        Ok(self.durable_lsn())
+    }
+}
+
+impl<F> LogWatermark for F
+where
+    F: Fn() -> Lsn + Send + Sync,
+{
+    #[inline]
+    fn durable_lsn(&self) -> Lsn {
+        self()
+    }
+}
+
 /// One cache frame: a reusable page buffer plus its residency bookkeeping.
 struct FrameInner {
     /// The page bytes. Reused in place across the pages that occupy this frame.
     page: RwLock<Page>,
-    /// The id of the page currently resident, or [`NO_PAGE`].
+    /// The id of the page currently resident, or [`NO_PAGE`]. Changed only
+    /// while `page` is write-locked.
     id: AtomicU64,
     /// Outstanding pins. A frame with `pin > 0` is never evicted.
     pin: AtomicUsize,
-    /// Set when the resident page has unflushed modifications.
+    /// Set when the resident page has unflushed modifications. Changed only
+    /// while `page` is write-locked.
     dirty: AtomicBool,
     /// The clock reference bit: set on access, cleared by the clock sweep.
     referenced: AtomicBool,
@@ -69,10 +166,19 @@ impl FrameInner {
 struct Core {
     /// Resident page id to frame index.
     map: HashMap<PageId, usize>,
-    /// Frame indices never yet filled, available without eviction.
+    /// Frame indices holding no page, available without eviction.
     free: Vec<usize>,
     /// The clock hand.
     hand: usize,
+}
+
+/// The outcome of one clock sweep.
+struct Sweep {
+    /// The frame to reuse, if one was found.
+    victim: Option<usize>,
+    /// The highest LSN among frames passed over only because the log is not
+    /// yet durable that far.
+    blocked: Option<Lsn>,
 }
 
 /// A bounded cache of pages over a [`PageStore`].
@@ -81,6 +187,9 @@ struct Core {
 /// [`PageFile`], so `BufferPool` without a type parameter is a pool over a file
 /// of pages. The handle is `Send + Sync` and every method takes `&self`, so it
 /// is shared across threads behind an `Arc` with no outer lock.
+///
+/// Dropping a pool discards its dirty frames without writing them. Call
+/// [`checkpoint`](BufferPool::checkpoint) first to keep them.
 ///
 /// # Examples
 ///
@@ -104,7 +213,7 @@ struct Core {
 /// pool.flush_all()?;
 /// pool.sync()?;
 ///
-/// // Fetch it back — served from cache if resident, else read from the file.
+/// // Fetch it back, served from cache if resident, else read from the file.
 /// let guard = pool.fetch(PageId::new(0))?;
 /// assert_eq!(&guard.read().payload()[..5], b"hello");
 /// # Ok::<(), page_db::PageError>(())
@@ -114,6 +223,8 @@ pub struct BufferPool<S = PageFile> {
     frames: Vec<Arc<FrameInner>>,
     core: Mutex<Core>,
     capacity: usize,
+    watermark: Option<Box<dyn LogWatermark>>,
+    sync_failed: AtomicBool,
 }
 
 impl BufferPool<PageFile> {
@@ -134,7 +245,7 @@ impl<S: PageStore> BufferPool<S> {
     /// Build a pool of `capacity` frames over `store`.
     ///
     /// `capacity` is the number of pages held resident; it is clamped up to at
-    /// least one. The frame buffers are allocated once, here — the pool does no
+    /// least one. The frame buffers are allocated once, here; the pool does no
     /// per-request allocation on the hot path.
     #[must_use]
     pub fn new(store: S, capacity: usize) -> Self {
@@ -153,7 +264,32 @@ impl<S: PageStore> BufferPool<S> {
                 hand: 0,
             }),
             capacity,
+            watermark: None,
+            sync_failed: AtomicBool::new(false),
         }
+    }
+
+    /// Enforce the write-ahead rule against `watermark`.
+    ///
+    /// From then on the pool never writes a dirty page whose LSN is beyond
+    /// [`LogWatermark::durable_lsn`]:
+    ///
+    /// - eviction passes over such pages and picks another victim; only when
+    ///   every unpinned frame is held back this way does it call
+    ///   [`LogWatermark::force`] and sweep again, failing with
+    ///   [`PageError::BufferPoolExhausted`] if the log still is not durable far
+    ///   enough;
+    /// - [`flush`](BufferPool::flush), [`flush_all`](BufferPool::flush_all), and
+    ///   [`checkpoint`](BufferPool::checkpoint) call `force` for such a page and
+    ///   write it if the log is then durable through its LSN, or leave it dirty
+    ///   and unwritten if not.
+    ///
+    /// Without a watermark (the default) the pool writes any dirty page it
+    /// flushes or evicts, whatever its LSN, as 1.0 did.
+    #[must_use]
+    pub fn with_log_watermark<W: LogWatermark + 'static>(mut self, watermark: W) -> Self {
+        self.watermark = Some(Box::new(watermark));
+        self
     }
 
     /// The number of frames in the pool.
@@ -184,7 +320,9 @@ impl<S: PageStore> BufferPool<S> {
     ///
     /// # Errors
     ///
-    /// - [`PageError::BufferPoolExhausted`] if every frame is pinned.
+    /// - [`PageError::BufferPoolExhausted`] if every frame is pinned (or, with a
+    ///   [`LogWatermark`], every unpinned frame holds a page the log is not yet
+    ///   durable for).
     /// - Whatever the store's read returns (for a file:
     ///   [`PageError::ShortRead`] past end-of-file, or an integrity error).
     /// - [`PageError::Io`] if flushing an evicted dirty victim fails.
@@ -199,24 +337,27 @@ impl<S: PageStore> BufferPool<S> {
         }
 
         let slot = self.take_slot(&mut core)?;
-        {
-            let frame = &self.frames[slot];
-            let mut page = sync::write(&frame.page);
-            if let Err(err) = self.store.read_into(id, &mut page) {
-                drop(page);
-                core.free.push(slot);
-                return Err(err);
-            }
+        let frame = &self.frames[slot];
+        let mut page = sync::write(&frame.page);
+        if let Err(err) = self.store.read_into(id, &mut page) {
+            frame.id.store(NO_PAGE, Ordering::Release);
+            frame.dirty.store(false, Ordering::Release);
+            drop(page);
+            core.free.push(slot);
+            return Err(err);
         }
-        Ok(self.install(&mut core, slot, id, false))
+        let guard = self.install(&mut core, slot, id, false);
+        drop(page);
+        Ok(guard)
     }
 
     /// Introduce a fresh, zeroed page at `id`, pinning it and returning a guard.
     ///
     /// The page is created in memory and marked dirty, so it is written to the
     /// store on the next flush; no read is performed. If `id` is already
-    /// resident it is reset to a blank page. The caller chooses the id — the
-    /// free-list allocator that picks ids is a later release.
+    /// resident it is reset to a blank page, which another holder of a guard on
+    /// it sees on its next read. The caller chooses the id; a
+    /// [`PageAllocator`](crate::PageAllocator) can pick it.
     ///
     /// # Errors
     ///
@@ -227,45 +368,113 @@ impl<S: PageStore> BufferPool<S> {
 
         if let Some(&slot) = core.map.get(&id) {
             let frame = self.frames[slot].clone();
-            sync::write(&frame.page).reset();
             let _ = frame.pin.fetch_add(1, Ordering::AcqRel);
-            frame.dirty.store(true, Ordering::Release);
             frame.referenced.store(true, Ordering::Release);
+            // The frame is pinned now, so it stays put; reset it after releasing
+            // the pool mutex, since another thread may hold its page lock.
+            drop(core);
+            {
+                let mut page = sync::write(&frame.page);
+                page.reset();
+                frame.dirty.store(true, Ordering::Release);
+            }
             return Ok(PageGuard { frame });
         }
 
         let slot = self.take_slot(&mut core)?;
-        sync::write(&self.frames[slot].page).reset();
-        Ok(self.install(&mut core, slot, id, true))
+        let frame = &self.frames[slot];
+        let mut page = sync::write(&frame.page);
+        page.reset();
+        let guard = self.install(&mut core, slot, id, true);
+        drop(page);
+        Ok(guard)
+    }
+
+    /// Drop page `id` from the pool without writing it, returning whether it
+    /// was resident.
+    ///
+    /// Use this when a page is freed: a [`PageAllocator`](crate::PageAllocator)
+    /// writes its free-list link into the freed page directly through the
+    /// store, so a dirty frame left in the pool for that page would overwrite
+    /// the link at the next flush or eviction. Discard the page before the
+    /// allocator's next [`sync`](crate::PageAllocator::sync). Any unflushed
+    /// changes to it are lost, which is the point.
+    ///
+    /// # Errors
+    ///
+    /// [`PageError::PagePinned`] if a [`PageGuard`] for the page is alive; the
+    /// page stays resident.
+    pub fn discard(&self, id: PageId) -> PageResult<bool> {
+        let mut core = sync::lock(&self.core);
+        let Some(&slot) = core.map.get(&id) else {
+            return Ok(false);
+        };
+        let frame = &self.frames[slot];
+        if frame.pin.load(Ordering::Acquire) > 0 {
+            return Err(PageError::PagePinned { page_id: id.get() });
+        }
+        {
+            // Unpinned, so only a flush can hold the lock; wait it out.
+            let _page = sync::write(&frame.page);
+            frame.dirty.store(false, Ordering::Release);
+            frame.referenced.store(false, Ordering::Release);
+            frame.id.store(NO_PAGE, Ordering::Release);
+        }
+        let _ = core.map.remove(&id);
+        core.free.push(slot);
+        Ok(true)
     }
 
     /// Flush page `id` to the store if it is resident and dirty.
     ///
     /// This places the bytes in the store; call [`sync`](BufferPool::sync) to
-    /// make them durable. Do not call this while holding a write guard to the
-    /// same page on the same thread — flushing takes the frame's lock.
+    /// make them durable. With a [`LogWatermark`], a page whose LSN the log is
+    /// not durable for (after [`LogWatermark::force`]) is left dirty and not
+    /// written. Do not call this while holding a [`PageRef`] or [`PageMut`] to
+    /// the same page on the same thread: flushing takes the page's lock.
     ///
     /// # Errors
     ///
-    /// Whatever the store's write returns.
+    /// Whatever the store's write, or forcing the log, returns.
     pub fn flush(&self, id: PageId) -> PageResult<()> {
-        let core = sync::lock(&self.core);
-        if let Some(&slot) = core.map.get(&id) {
-            self.flush_slot(slot, id)?;
-        }
-        Ok(())
+        let frame = {
+            let core = sync::lock(&self.core);
+            match core.map.get(&id) {
+                Some(&slot) => self.frames[slot].clone(),
+                None => return Ok(()),
+            }
+        };
+        let mut durable = None;
+        self.flush_frame(&frame, id, &mut durable)
     }
 
-    /// Flush every dirty resident page to the store.
+    /// Flush every dirty resident page to the store, in page-id order.
+    ///
+    /// The pages to flush are chosen under the pool's mutex, which is then
+    /// released before any page is locked or written, so other threads keep
+    /// fetching while the flush runs. With a [`LogWatermark`], pages the log is
+    /// not durable for are left dirty and not written (see
+    /// [`flush`](BufferPool::flush)). Do not call this while holding a
+    /// [`PageRef`] or [`PageMut`] on the same thread.
     ///
     /// # Errors
     ///
-    /// Whatever the store's write returns. On error, some pages may already have
-    /// been flushed; the operation is safe to retry.
+    /// Whatever the store's write, or forcing the log, returns. On error, some
+    /// pages may already have been flushed; a page whose write failed stays
+    /// dirty, so retrying the flush writes it again.
     pub fn flush_all(&self) -> PageResult<()> {
-        let core = sync::lock(&self.core);
-        for (&id, &slot) in core.map.iter() {
-            self.flush_slot(slot, id)?;
+        let mut targets: Vec<(PageId, Arc<FrameInner>)> = {
+            let core = sync::lock(&self.core);
+            core.map
+                .iter()
+                .filter(|&(_, &slot)| self.frames[slot].dirty.load(Ordering::Acquire))
+                .map(|(&id, &slot)| (id, self.frames[slot].clone()))
+                .collect()
+        };
+        targets.sort_unstable_by_key(|&(id, _)| id);
+        let mut durable = None;
+        for (id, frame) in &targets {
+            self.flush_frame(frame, *id, &mut durable)?;
         }
         Ok(())
     }
@@ -273,7 +482,9 @@ impl<S: PageStore> BufferPool<S> {
     /// Flush all dirty pages, then make the store durable.
     ///
     /// Equivalent to [`flush_all`](BufferPool::flush_all) followed by
-    /// [`sync`](BufferPool::sync) — the common checkpoint sequence.
+    /// [`sync`](BufferPool::sync), the common checkpoint sequence. If the sync
+    /// fails, do not retry the checkpoint on this pool: see
+    /// [`sync`](BufferPool::sync).
     ///
     /// # Errors
     ///
@@ -289,15 +500,30 @@ impl<S: PageStore> BufferPool<S> {
     /// [`flush_all`](BufferPool::flush_all) or
     /// [`checkpoint`](BufferPool::checkpoint) for that.
     ///
+    /// A failed sync is sticky. The pages it covered were already marked clean
+    /// when they were written, and the OS may have dropped the ones it could not
+    /// persist, so a retry could succeed without them. After the first failure
+    /// every later `sync` (and so every `checkpoint`) on this pool returns an
+    /// error; reopen the store and recover from the log.
+    ///
     /// # Errors
     ///
-    /// Whatever the store's sync returns.
+    /// Whatever the store's sync returns, or [`PageError::Io`] if an earlier
+    /// sync on this pool failed.
     pub fn sync(&self) -> PageResult<()> {
-        self.store.sync()
+        if self.sync_failed.load(Ordering::Acquire) {
+            return Err(sync_poisoned());
+        }
+        if let Err(err) = self.store.sync() {
+            self.sync_failed.store(true, Ordering::Release);
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Install a freshly loaded or created page into `slot`, returning a pinned
-    /// guard. Caller holds `core` and has already populated the frame's buffer.
+    /// guard. Caller holds `core` and the frame's page write lock, and has
+    /// already populated the frame's buffer.
     fn install(&self, core: &mut Core, slot: usize, id: PageId, dirty: bool) -> PageGuard {
         let frame = &self.frames[slot];
         frame.id.store(id.get(), Ordering::Release);
@@ -310,14 +536,36 @@ impl<S: PageStore> BufferPool<S> {
         }
     }
 
-    /// Flush the page in `slot` (resident id `id`) if dirty.
-    fn flush_slot(&self, slot: usize, id: PageId) -> PageResult<()> {
-        let frame = &self.frames[slot];
-        if frame.dirty.load(Ordering::Acquire) {
-            let mut page = sync::write(&frame.page);
-            self.store.write_page(id, &mut page)?;
-            frame.dirty.store(false, Ordering::Release);
+    /// Flush `frame` if it still holds page `id` and is dirty. Called without
+    /// the pool mutex. `durable` caches the log watermark across one flush call.
+    fn flush_frame(
+        &self,
+        frame: &FrameInner,
+        id: PageId,
+        durable: &mut Option<Lsn>,
+    ) -> PageResult<()> {
+        let mut page = sync::write(&frame.page);
+        // The id and the dirty bit change only under this lock, so this check
+        // and the write below see one consistent state of the frame.
+        if frame.id.load(Ordering::Acquire) != id.get() || !frame.dirty.load(Ordering::Acquire) {
+            return Ok(());
         }
+        if let Some(watermark) = &self.watermark {
+            let lsn = page.lsn();
+            let mut point = match *durable {
+                Some(point) => point,
+                None => watermark.durable_lsn(),
+            };
+            if lsn > point {
+                point = watermark.force(lsn)?;
+            }
+            *durable = Some(point);
+            if lsn > point {
+                return Ok(());
+            }
+        }
+        self.store.write_page(id, &mut page)?;
+        frame.dirty.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -327,24 +575,44 @@ impl<S: PageStore> BufferPool<S> {
         if let Some(slot) = core.free.pop() {
             return Ok(slot);
         }
-        let slot = match self.find_victim(core) {
-            Some(slot) => slot,
-            None => {
-                return Err(PageError::BufferPoolExhausted {
-                    capacity: self.capacity,
-                });
-            }
+        let exhausted = PageError::BufferPoolExhausted {
+            capacity: self.capacity,
         };
-        let victim_id = self.frames[slot].resident_id();
-        self.flush_slot(slot, victim_id)?;
+        let durable = self.watermark.as_ref().map(|w| w.durable_lsn());
+        let sweep = self.find_victim(core, durable);
+        let slot = match (sweep.victim, sweep.blocked, &self.watermark) {
+            (Some(slot), _, _) => slot,
+            (None, Some(lsn), Some(watermark)) => {
+                // Every evictable frame waits on the log: force it and retry.
+                let point = watermark.force(lsn)?;
+                match self.find_victim(core, Some(point)).victim {
+                    Some(slot) => slot,
+                    None => return Err(exhausted),
+                }
+            }
+            _ => return Err(exhausted),
+        };
+
+        let frame = &self.frames[slot];
+        let victim_id = frame.resident_id();
+        {
+            // The victim is unpinned, so only a flush can hold its lock, and a
+            // flush never waits on the pool mutex: this cannot deadlock.
+            let mut page = sync::write(&frame.page);
+            if frame.dirty.load(Ordering::Acquire) {
+                self.store.write_page(victim_id, &mut page)?;
+                frame.dirty.store(false, Ordering::Release);
+            }
+        }
         let _ = core.map.remove(&victim_id);
         Ok(slot)
     }
 
-    /// The clock sweep: return an unpinned frame to reuse, or `None` if all
-    /// frames are pinned. Caller holds `core`.
-    fn find_victim(&self, core: &mut Core) -> Option<usize> {
+    /// The clock sweep: find an unpinned frame to reuse. With a durable point,
+    /// a dirty frame whose LSN is beyond it is passed over. Caller holds `core`.
+    fn find_victim(&self, core: &mut Core, durable: Option<Lsn>) -> Sweep {
         let n = self.capacity;
+        let mut blocked: Option<Lsn> = None;
         // Two full passes: the first clears reference bits, the second selects.
         // If every frame stays pinned across both, the pool is exhausted.
         let mut steps = 0;
@@ -360,9 +628,24 @@ impl<S: PageStore> BufferPool<S> {
             if frame.referenced.swap(false, Ordering::AcqRel) {
                 continue;
             }
-            return Some(slot);
+            if let Some(point) = durable {
+                if frame.dirty.load(Ordering::Acquire) {
+                    let lsn = sync::read(&frame.page).lsn();
+                    if lsn > point {
+                        blocked = Some(blocked.map_or(lsn, |b| b.max(lsn)));
+                        continue;
+                    }
+                }
+            }
+            return Sweep {
+                victim: Some(slot),
+                blocked,
+            };
         }
-        None
+        Sweep {
+            victim: None,
+            blocked,
+        }
     }
 }
 
@@ -403,15 +686,16 @@ impl PageGuard {
 
     /// Borrow the page for writing, marking it dirty.
     ///
-    /// The page is recorded dirty as soon as the write guard is taken, so it
-    /// will be flushed even if the actual mutation is conditional.
+    /// The page is recorded dirty once the page lock is held and before the
+    /// borrow is returned, so it will be flushed even if the actual mutation is
+    /// conditional, and a flush running at the same time either completes
+    /// before the write or sees the page dirty after it.
     #[inline]
     #[must_use]
     pub fn write(&self) -> PageMut<'_> {
+        let guard = sync::write(&self.frame.page);
         self.frame.dirty.store(true, Ordering::Release);
-        PageMut {
-            guard: sync::write(&self.frame.page),
-        }
+        PageMut { guard }
     }
 }
 
@@ -672,6 +956,60 @@ mod loom_tests {
                 pool.store_contains_loom(0)
             };
             assert!(store_pages, "evicted dirty page 0 was not flushed");
+        });
+    }
+
+    /// A write that overlaps a flush of the same page is never lost: whichever
+    /// order the flush and the write take the page lock in, the write either
+    /// reaches the store in that flush or leaves the page dirty for the next
+    /// one, so after the guard is released and the page evicted, a fetch
+    /// returns the written value.
+    #[test]
+    fn loom_write_during_flush_is_not_lost() {
+        loom::model(|| {
+            let pool = Arc::new(BufferPool::new(MemStore::new(4096), 1));
+            {
+                let guard = pool.new_page(PageId::new(0)).unwrap();
+                guard.write().payload_mut()[0] = 1;
+            }
+            let guard = pool.fetch(PageId::new(0)).unwrap();
+
+            let p = Arc::clone(&pool);
+            let flusher = loom::thread::spawn(move || p.flush_all().unwrap());
+            guard.write().payload_mut()[0] = 2;
+            flusher.join().unwrap();
+            drop(guard);
+
+            // Evict page 0 (writing it if still dirty), then read it back.
+            drop(pool.new_page(PageId::new(1)).unwrap());
+            let back = pool.fetch(PageId::new(0)).unwrap();
+            assert_eq!(
+                back.read().payload()[0],
+                2,
+                "the overlapping write was lost"
+            );
+        });
+    }
+
+    /// A checkpoint never deadlocks against latch coupling: one thread holds a
+    /// page's write lock and fetches another page while a checkpoint flushes the
+    /// latched page. Loom reports a deadlock if both can block each other.
+    #[test]
+    fn loom_checkpoint_with_latch_coupling_does_not_deadlock() {
+        loom::model(|| {
+            let pool = Arc::new(BufferPool::new(MemStore::new(4096), 2));
+            drop(pool.new_page(PageId::new(1)).unwrap());
+            let parent = pool.new_page(PageId::new(0)).unwrap();
+
+            let p = Arc::clone(&pool);
+            let checkpointer = loom::thread::spawn(move || p.checkpoint().unwrap());
+            {
+                let mut latch = parent.write();
+                let child = pool.fetch(PageId::new(1)).unwrap();
+                latch.payload_mut()[0] = child.read().payload()[0];
+            }
+            checkpointer.join().unwrap();
+            drop(parent);
         });
     }
 

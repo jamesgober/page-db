@@ -13,12 +13,49 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-/// Open `path` read-write for paged I/O.
+/// Open `path` read-write for paged I/O, returning the file and whether this
+/// call created it.
 ///
 /// When `direct` is set, the OS page cache is bypassed (Direct I/O). When
-/// `create` is set, the file is created if it does not exist.
-pub(crate) fn open(path: &Path, direct: bool, create: bool) -> io::Result<File> {
-    imp::open(path, direct, create)
+/// `create` is set, the file is created if it does not exist. Knowing that the
+/// file was created lets the caller make its directory entry durable on the
+/// first sync (see [`sync_dir`]).
+pub(crate) fn open(path: &Path, direct: bool, create: bool) -> io::Result<(File, bool)> {
+    if !create {
+        return Ok((imp::open(path, direct, false, false)?, false));
+    }
+    match imp::open(path, direct, false, true) {
+        Ok(file) => Ok((file, true)),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            Ok((imp::open(path, direct, true, false)?, false))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Make the directory entry of a newly created file at `path` durable.
+///
+/// On Unix a `fdatasync` of a new file does not persist its name; the parent
+/// directory has to be flushed as well. On Windows the file system journals the
+/// entry with the file's metadata and a directory cannot be flushed through
+/// `std`, so this does nothing there.
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    imp::sync_dir(path)
+}
+
+/// The directory holding `path`, treating a bare file name as the current
+/// directory.
+#[cfg(unix)]
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    File::open(parent_dir(path))?.sync_all()
 }
 
 /// Flush all written data to stable storage.
@@ -100,9 +137,18 @@ mod imp {
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
 
-    pub(super) fn open(path: &Path, direct: bool, create: bool) -> io::Result<File> {
+    pub(super) fn open(
+        path: &Path,
+        direct: bool,
+        create: bool,
+        create_new: bool,
+    ) -> io::Result<File> {
         let mut opts = OpenOptions::new();
-        let _ = opts.read(true).write(true).create(create);
+        let _ = opts
+            .read(true)
+            .write(true)
+            .create(create)
+            .create_new(create_new);
         if direct {
             let _ = opts.custom_flags(libc::O_DIRECT);
         }
@@ -111,6 +157,10 @@ mod imp {
 
     pub(super) fn sync_data(file: &File) -> io::Result<()> {
         file.sync_data()
+    }
+
+    pub(super) fn sync_dir(path: &Path) -> io::Result<()> {
+        super::sync_parent_dir(path)
     }
 }
 
@@ -121,11 +171,17 @@ mod imp {
     use std::os::unix::io::AsRawFd;
     use std::path::Path;
 
-    pub(super) fn open(path: &Path, direct: bool, create: bool) -> io::Result<File> {
+    pub(super) fn open(
+        path: &Path,
+        direct: bool,
+        create: bool,
+        create_new: bool,
+    ) -> io::Result<File> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(create)
+            .create_new(create_new)
             .open(path)?;
         if direct {
             let fd = file.as_raw_fd();
@@ -151,6 +207,10 @@ mod imp {
         }
         Ok(())
     }
+
+    pub(super) fn sync_dir(path: &Path) -> io::Result<()> {
+        super::sync_parent_dir(path)
+    }
 }
 
 #[cfg(windows)]
@@ -166,9 +226,18 @@ mod imp {
     const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
     const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
 
-    pub(super) fn open(path: &Path, direct: bool, create: bool) -> io::Result<File> {
+    pub(super) fn open(
+        path: &Path,
+        direct: bool,
+        create: bool,
+        create_new: bool,
+    ) -> io::Result<File> {
         let mut opts = OpenOptions::new();
-        let _ = opts.read(true).write(true).create(create);
+        let _ = opts
+            .read(true)
+            .write(true)
+            .create(create)
+            .create_new(create_new);
         if direct {
             let _ = opts.custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH);
         }
@@ -177,6 +246,10 @@ mod imp {
 
     pub(super) fn sync_data(file: &File) -> io::Result<()> {
         file.sync_data()
+    }
+
+    pub(super) fn sync_dir(_path: &Path) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -189,15 +262,25 @@ mod imp {
     // Outside the supported Unix targets the cache-bypass hint is not applied:
     // there is no portable `O_DIRECT` equivalent to honor. Durability still
     // comes from `sync_data`; only page-cache behavior differs.
-    pub(super) fn open(path: &Path, _direct: bool, create: bool) -> io::Result<File> {
+    pub(super) fn open(
+        path: &Path,
+        _direct: bool,
+        create: bool,
+        create_new: bool,
+    ) -> io::Result<File> {
         OpenOptions::new()
             .read(true)
             .write(true)
             .create(create)
+            .create_new(create_new)
             .open(path)
     }
 
     pub(super) fn sync_data(file: &File) -> io::Result<()> {
         file.sync_data()
+    }
+
+    pub(super) fn sync_dir(path: &Path) -> io::Result<()> {
+        super::sync_parent_dir(path)
     }
 }
