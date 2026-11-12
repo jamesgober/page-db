@@ -41,6 +41,11 @@ pub trait PageStore: Send + Sync {
     /// Reusing the caller's buffer is what lets the pool recycle a frame on a
     /// miss without allocating.
     ///
+    /// When the bytes are read but fail verification, leave them in `page`
+    /// and return the integrity error. The allocator relies on that to recover
+    /// a torn superblock from the copy that survived; a store that leaves
+    /// `page` untouched still works, but a damaged page 0 then fails to open.
+    ///
     /// # Errors
     ///
     /// Implementation-defined; for a file this is a short read past end-of-file

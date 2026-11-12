@@ -8,6 +8,78 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-11
+
+Fixes from an independent review of 1.0.0: a lost write in the buffer pool, a
+deadlock between a checkpoint and latch coupling, the write-ahead rule on
+eviction, and two ways the allocator could make a file unopenable. No breaking
+API change, no MSRV change, and the on-disk format stays 1.x: files move freely
+between 1.0 and 1.1 (see [`docs/ON_DISK_FORMAT.md`](docs/ON_DISK_FORMAT.md)).
+
+### Fixed
+
+- **A write that overlapped a flush could be lost.** `PageGuard::write` set the
+  dirty bit before taking the page lock, so a write that waited behind a flush
+  ended up on a frame the flush had just marked clean, and eviction dropped it.
+  The dirty bit (and a frame's resident id) now change only under the page lock.
+  Covered by a deterministic interleaving test and a new loom model.
+- **`checkpoint`, `flush_all`, `flush`, and `new_page` could deadlock against
+  latch coupling.** They waited on a page lock while holding the pool mutex, so
+  a thread holding a page's write borrow and fetching another page hung against
+  a checkpoint. Flushes now pick their pages under the mutex and release it
+  before locking any page; `new_page` resets a resident page after releasing it.
+  Covered by regression tests and a loom model that reports a deadlock.
+- **`PageAllocator::free` accepted a double free**, handed the same id to two
+  owners, and after the next sync the file could not be opened again. A second
+  free of an id now returns `InvalidPageId` and leaves the free-list unchanged.
+- **One torn superblock page made the allocator unopenable**, and `sync` wrote
+  the free-list links and the superblock with no ordering between them. Page 0
+  now also holds two checksummed superblock records with a generation number,
+  in bytes 1.0 leaves zero; `sync` syncs the links, then writes copy B, syncs,
+  writes copy A and the 1.0 fields, and syncs. Opening picks the newest copy
+  whose free-list chain checks out. If none does, it opens with the newest
+  high-water mark and an empty free-list (pages leak, never hand out twice)
+  instead of failing.
+- **A page id whose byte offset overflows** panicked in debug builds and wrapped
+  onto a low page in release builds. `PageFile` now returns `InvalidPageId`, and
+  the allocator rejects a high-water mark beyond the addressable range on open
+  and stops allocating at it.
+- **A failed sync was not sticky**, so a retried checkpoint wrote nothing and
+  reported success. After a failed sync, every later sync on the same
+  `PageFile` or `BufferPool` returns an error; reopen and recover from the log.
+- **A new page file's directory entry was never flushed.** On Unix the first
+  successful `PageFile::sync` of a file the handle created now flushes the
+  parent directory.
+- **A pool flush could overwrite a free-list link** when a freed page still had a
+  dirty frame. `BufferPool::discard` drops the frame; the allocator detects an
+  overwritten link through the chain checksum instead of failing to open.
+
+### Added
+
+- `LogWatermark` and `BufferPool::with_log_watermark`: the pool never writes a
+  page whose LSN is beyond the log's durable point. Eviction passes over such
+  pages and forces the log only when nothing else can be evicted; flushes force
+  the log first or leave the page dirty. Any `Fn() -> Lsn` closure is a
+  watermark. Without one, the pool behaves as in 1.0.
+- `BufferPool::discard`: drop a page from the pool without writing it.
+- `PageAllocator::from_state`: rebuild an allocator from a high-water mark and a
+  free-list held elsewhere, such as a write-ahead log.
+- `PageAllocator::free_list_dropped`: whether opening had to start with an empty
+  free-list.
+- `PageError::PagePinned`, returned by `discard` for a pinned page.
+
+### Changed
+
+- `flush_all` and `checkpoint` write pages in page-id order and no longer hold
+  the pool mutex while writing, so fetches proceed during a checkpoint.
+- `PageAllocator::sync` writes only the free-list links that changed since the
+  last sync instead of every link, and makes three syncs instead of one
+  (links, copy B, copy A), two when no link changed.
+- Docs: the README described the pool as LRU (it is clock), the checksum as
+  CRC32 (it is CRC32C), and Direct I/O as having an automatic buffered fallback
+  (it is the `direct_io(false)` option). Dropping a pool discards dirty frames;
+  that is now documented.
+
 ## [1.0.0] - 2026-06-06
 
 **The first stable release.** The public API is frozen until 2.0 and the on-disk
@@ -210,7 +282,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` (Node 24 actions; fmt, clippy, test, doc, audit, deny) and `.github/FUNDING.yml`.
 
 <!-- LINKS -->
-[Unreleased]: https://github.com/jamesgober/page-db/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/page-db/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jamesgober/page-db/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/page-db/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/jamesgober/page-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/page-db/compare/v0.3.0...v0.4.0

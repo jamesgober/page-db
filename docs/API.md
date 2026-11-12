@@ -115,7 +115,9 @@ that **pins** the page — a pinned page is never evicted — and dropping the g
 unpins it. Writing through the guard marks the page **dirty**, and a dirty page
 is always flushed to the store before its frame is reused. When every frame is
 pinned, the pool returns [`BufferPoolExhausted`](#pageerror--pageresult) rather
-than evict something it must not.
+than evict something it must not. A [`LogWatermark`](#logwatermark) makes the
+pool keep the write-ahead rule: a page is written only once the log is durable
+through its LSN.
 
 A [`PageAllocator`](#pageallocator) manages the **id space**:
 [`allocate`](#pageallocator) hands out an unused id, [`free`](#pageallocator)
@@ -478,7 +480,9 @@ and every method takes `&self`.
 | `flush` | `fn flush(&self, id: PageId) -> PageResult<()>` | Write `id` to the store if resident and dirty. |
 | `flush_all` | `fn flush_all(&self) -> PageResult<()>` | Write every dirty resident page. |
 | `checkpoint` | `fn checkpoint(&self) -> PageResult<()>` | `flush_all` then `sync`. |
-| `sync` | `fn sync(&self) -> PageResult<()>` | Make the store durable. |
+| `sync` | `fn sync(&self) -> PageResult<()>` | Make the store durable. A failed sync is sticky. |
+| `with_log_watermark` | `fn with_log_watermark<W: LogWatermark + 'static>(self, watermark: W) -> BufferPool<S>` | Enforce the write-ahead rule against `watermark` (1.1). |
+| `discard` | `fn discard(&self, id: PageId) -> PageResult<bool>` | Drop `id` from the pool without writing it (1.1). |
 
 **Parameters.**
 
@@ -488,14 +492,34 @@ and every method takes `&self`.
 - `fetch` — `id` is the page to pin. Served from cache if resident; otherwise a
   frame is reused (a dirty victim is flushed first) and the page is read in.
 - `new_page` — `id` is the slot to create. The page is zeroed, marked dirty, and
-  pinned; no read happens. The caller chooses the id (a free-list allocator is a
-  later release). If `id` is already resident it is reset to blank.
+  pinned; no read happens. The caller chooses the id (a
+  [`PageAllocator`](#pageallocator) can pick it). If `id` is already resident it
+  is reset to blank.
+- `discard`: `id` is the page to drop. Its frame is freed without a write, so
+  unflushed changes are lost. Call it before freeing the page with the
+  allocator.
 
 **Errors.** `fetch` and `new_page` return
 [`BufferPoolExhausted`](#pageerror--pageresult) when every frame is pinned;
 `fetch` also surfaces the store's read errors (e.g.
 [`ShortRead`](#pageerror--pageresult) for an unwritten slot). Flushing surfaces
-the store's write errors.
+the store's write errors. `discard` returns
+[`PagePinned`](#pageerror--pageresult) while a guard on the page is alive.
+
+**Concurrency.** Flushes pick their pages under the pool's mutex and release it
+before locking or writing any page, so a checkpoint runs alongside fetches, and
+a thread may fetch a page while it holds another page's write borrow (latch
+coupling). A write that overlaps a flush of the same page is either written by
+that flush or left dirty for the next. Do not flush a page from the thread that
+holds its `PageRef` or `PageMut`.
+
+**Sync failures.** A failed `sync` (and so a failed `checkpoint`) is permanent
+for the pool and for a `PageFile`: every later sync returns an error, because
+the OS may have dropped the pages it could not write. Reopen and recover from
+the log instead of retrying.
+
+**Dropping a pool** discards its dirty frames without writing them; checkpoint
+first to keep them.
 
 **Create, write, checkpoint, fetch.**
 
@@ -542,6 +566,55 @@ assert!(pool.is_resident(PageId::new(0)));
 drop(held);                                                  // now a frame is free
 # Ok::<(), page_db::PageError>(())
 ```
+
+**The write-ahead rule.** With a watermark the pool writes a dirty page only
+when its LSN is at or below the log's durable point.
+
+```rust
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use page_db::{BufferPool, Lsn, PageId, DEFAULT_PAGE_SIZE};
+
+# let dir = tempfile::tempdir().unwrap();
+# let path = dir.path().join("data.pages");
+let durable = Arc::new(AtomicU64::new(0));
+let seen = Arc::clone(&durable);
+let pool = BufferPool::open(&path, DEFAULT_PAGE_SIZE, 64)?
+    .with_log_watermark(move || Lsn::new(seen.load(Ordering::Acquire)));
+
+{
+    let guard = pool.new_page(PageId::new(0))?;
+    guard.write().set_lsn(Lsn::new(10));
+}
+pool.flush_all()?;                       // the log is not durable to 10 yet
+assert!(pool.fetch(PageId::new(0))?.is_dirty());
+
+durable.store(10, Ordering::Release);    // the log syncs through LSN 10
+pool.checkpoint()?;                      // now the page is written
+assert!(!pool.fetch(PageId::new(0))?.is_dirty());
+# Ok::<(), page_db::PageError>(())
+```
+
+<br>
+
+### `LogWatermark`
+
+The durable point of a write-ahead log, consulted before the pool writes a page
+(1.1). Any `Fn() -> Lsn + Send + Sync` closure is one; implement the trait to
+also let the pool force the log.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `durable_lsn` | `fn durable_lsn(&self) -> Lsn` | The highest LSN whose log record is durable. |
+| `force` | `fn force(&self, lsn: Lsn) -> PageResult<Lsn>` | Make the log durable through at least `lsn` and return the new durable point. The default does not force. |
+
+Eviction passes over a dirty page beyond the durable point and picks another
+victim; only when every unpinned frame is held back does it call `force` and
+sweep again. `flush`, `flush_all`, and `checkpoint` call `force` for such a page
+and write it if the log is then durable through its LSN, or leave it dirty. The
+pool may call both methods while holding its own locks, so they must not call
+back into the pool. Without a watermark the pool writes any dirty page it
+flushes or evicts, as 1.0 did.
 
 <br>
 
@@ -602,16 +675,27 @@ takes `&self`.
 | `high_water` | `fn high_water(&self) -> u64` | One past the highest id ever handed out. |
 | `free_count` | `fn free_count(&self) -> u64` | Ids currently free for reuse. |
 | `sync` | `fn sync(&self) -> PageResult<()>` | Persist the superblock + free-list, then sync the store. |
+| `from_state` | `fn from_state<I: IntoIterator<Item = PageId>>(store: S, next_new: u64, free_ids: I) -> PageResult<PageAllocator<S>>` | Rebuild from state held elsewhere, such as a write-ahead log (1.1). |
+| `free_list_dropped` | `fn free_list_dropped(&self) -> bool` | Whether opening had to start with an empty free-list (1.1). |
 
 **Durability.** `allocate` and `free` touch only memory; `sync` writes the state
 to disk. Call it as part of the same checkpoint that makes the allocated pages
 durable — the high-water mark must reach stable storage no later than the data
 written beyond it. The write-ahead log above is the authority on crash recovery.
 
+**Torn writes.** Page 0 holds two checksummed copies of the superblock, and
+`sync` writes them one at a time with a sync in between, after syncing the
+free-list links. Opening picks the newest copy whose free-list chain checks out,
+so a torn page 0 still opens. If no chain checks out (a crash in the middle of a
+sync, or a free page overwritten by a stale pool frame), the allocator opens
+with the newest high-water mark and an empty free-list: the free pages are
+leaked, never handed out twice, and `free_list_dropped` returns `true`.
+`from_state` rebuilds the free-list from the log.
+
 **Errors.** `free` returns [`InvalidPageId`](#pageerror--pageresult) for the
-reserved id 0 or an id that was never allocated. `new` / `open` returns
-[`InvalidSuperblock`](#pageerror--pageresult) if page 0 exists but is not a
-superblock the allocator wrote.
+reserved id 0, an id that was never allocated, or an id that is already free.
+`new` / `open` returns [`InvalidSuperblock`](#pageerror--pageresult) if page 0
+exists but is not a superblock the allocator wrote.
 
 **Allocate, free, reuse.**
 
@@ -637,7 +721,9 @@ alloc.sync()?;               // persist the allocator state durably
 ```
 
 **Sharing a file with a pool.** Wrap the file in an `Arc` and give a clone to
-each; `Arc<PageFile>` is a [`PageStore`](#pagestore).
+each; `Arc<PageFile>` is a [`PageStore`](#pagestore). The allocator writes each
+free page's link into the page itself, so discard the page from the pool before
+freeing it.
 
 ```rust
 use std::sync::Arc;
@@ -654,6 +740,11 @@ let guard = pool.new_page(id)?;             // pool caches the page there
 guard.write().payload_mut()[0] = 0x7;
 pool.flush_all()?;
 alloc.sync()?;                              // persist allocator + page data
+drop(guard);
+
+pool.discard(id)?;                          // done with the page
+alloc.free(id)?;
+alloc.sync()?;
 # let _ = PageId::new(0);
 # Ok::<(), page_db::PageError>(())
 ```
@@ -670,7 +761,7 @@ and an allocator share one file. Most users never name this trait directly.
 |--------|-----------|-------------|
 | `page_size` | `fn page_size(&self) -> usize` | The store's page size. |
 | `allocate_page` | `fn allocate_page(&self) -> Page` | A blank page of the right size. |
-| `read_into` | `fn read_into(&self, id: PageId, page: &mut Page) -> PageResult<()>` | Read `id` into `page`, verifying it. |
+| `read_into` | `fn read_into(&self, id: PageId, page: &mut Page) -> PageResult<()>` | Read `id` into `page`, verifying it. On an integrity error, leave the bytes read in `page`. |
 | `write_page` | `fn write_page(&self, id: PageId, page: &mut Page) -> PageResult<()>` | Write `page` to `id` (stamps id + checksum). |
 | `sync` | `fn sync(&self) -> PageResult<()>` | Flush to durability. |
 
@@ -703,8 +794,9 @@ match with a wildcard arm.
 | `MisdirectedPage { requested, found }` | The slot holds a page stamped with a different id. | A misdirected read/write — surface as corruption. |
 | `ShortRead { page_id, got, page_size }` | The slot is past end-of-file, or the file is not a whole number of pages. | Allocate the slot first, or check `page_count`. |
 | `BufferPoolExhausted { capacity }` | Every frame in a [`BufferPool`](#bufferpool) is pinned. | Release some [`PageGuard`](#pageguard-pageref-pagemut)s, or size the pool larger. |
-| `InvalidPageId { page_id }` | An id handed to [`PageAllocator::free`](#pageallocator) is the reserved superblock (0) or was never allocated. | Free only ids the allocator returned, exactly once. |
+| `InvalidPageId { page_id }` | An id handed to [`PageAllocator::free`](#pageallocator) is the reserved superblock (0), was never allocated, or is already free; or an id's byte offset does not fit in 64 bits. | Free only ids the allocator returned, exactly once; treat a huge id as corruption. |
 | `InvalidSuperblock` | Page 0 is not a valid allocator superblock. | The file was not initialized by the allocator, or it is corrupt. |
+| `PagePinned { page_id }` | [`BufferPool::discard`](#bufferpool) found a live guard on the page (1.1). | Drop the guard first. |
 
 ```rust
 use page_db::{PageFile, PageId, PageError, DEFAULT_PAGE_SIZE};
@@ -783,9 +875,9 @@ The crate is `std`-only: a file-backed, Direct-I/O page store is inherently
 
 ## Notes
 
-- **On-disk format is unstable across 0.x.** Files written by 0.2 are not
-  guaranteed readable by later 0.x releases; the format is frozen for 1.x before
-  1.0.
+- **On-disk format is frozen for 1.x.** 1.1 adds two superblock copies in
+  page 0 bytes that 1.0 writes as zero and ignores, so files move freely between
+  1.0 and 1.1 (see [`ON_DISK_FORMAT.md`](./ON_DISK_FORMAT.md)).
 - **Direct I/O alignment** is handled for you: page buffers are aligned to the
   page size, which satisfies the block-alignment rules on every supported
   platform for page sizes of 4 KiB and up.
@@ -798,7 +890,8 @@ The crate is `std`-only: a file-backed, Direct-I/O page store is inherently
   directly.
 - **Allocator and pool over one file.** Wrap the `PageFile` in an `Arc` and hand
   a clone to each (`Arc<S>: PageStore`). The allocator owns page 0; do not use it
-  for data, and free a page only once it is no longer cached or in use.
+  for data, and free a page only once it is no longer in use, after
+  `BufferPool::discard`.
 
 ---
 

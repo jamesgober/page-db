@@ -12,8 +12,11 @@
 //! tracking, so hot pages stay resident and the engine above asks for a page by
 //! id and gets back a pinned frame. The [`PageAllocator`] manages the id space:
 //! it hands out unused ids and reclaims freed ones through an on-disk free-list.
-//! Compose them over one shared store with `Arc` (see [`PageStore`]). The public
-//! API is feature-frozen as of v0.4.0; see `dev/ROADMAP.md`.
+//! Compose them over one shared store with `Arc` (see [`PageStore`]), and
+//! [`discard`](BufferPool::discard) a page from the pool before freeing it. A
+//! database with a write-ahead log installs a [`LogWatermark`] on the pool so a
+//! page never reaches disk before its log record. The public API is stable
+//! until 2.0; 1.x releases only add to it.
 //!
 //! ## Straight to the file
 //!
@@ -102,5 +105,5 @@ pub use crate::file::{PageFile, PageFileOptions};
 pub use crate::page::{
     DEFAULT_PAGE_SIZE, Lsn, MAX_PAGE_SIZE, MIN_PAGE_SIZE, PAGE_HEADER_SIZE, Page, PageId, PageSize,
 };
-pub use crate::pool::{BufferPool, PageGuard, PageMut, PageRef};
+pub use crate::pool::{BufferPool, LogWatermark, PageGuard, PageMut, PageRef};
 pub use crate::store::PageStore;

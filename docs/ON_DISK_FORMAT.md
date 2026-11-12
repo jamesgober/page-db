@@ -29,6 +29,7 @@
 |---------|-----------|
 | Page header | Frozen for 1.x as of 1.0.0 |
 | Allocator superblock + free-list chain | Frozen for 1.x as of 1.0.0 |
+| Superblock records (copies A and B) | Added in 1.1.0, frozen for 1.x |
 
 A change to a frozen layout is a breaking change requiring a major version and a
 documented migration. Additive, backward-compatible changes (a new meaning for a
@@ -156,6 +157,70 @@ allocator's persistent state:
 
 The allocator hands out ids starting at `1`; page 0 is never a data page.
 
+The largest usable id is one whose whole page lies within a 64-bit byte offset:
+`next new` must not exceed `floor((2^64 - 1) / page_size)` (since 1.1.0 a
+reader rejects a larger one as invalid).
+
+## Superblock records
+
+Since 1.1.0 page 0 also carries two **superblock records**, copy A and copy B,
+in payload bytes that 1.0 writes as zero and ignores. A 1.0 reader therefore
+reads a 1.1 file from the fields above, and a 1.1 reader opens a 1.0 file (whose
+records are absent) from the same fields.
+
+| Copy | Payload offset | Page offset (4 KiB page) |
+|------|----------------|--------------------------|
+| A | `32` | `64`, in the page's first 512-byte sector |
+| B | `page_size / 2 - 32` | `2048`, the start of the page's second half |
+
+Each record is 48 bytes:
+
+| Field | Type | Record offset | Meaning |
+|-------|------|---------------|---------|
+| `rec magic` | `u32` | 0 | Constant `0x52534750`, ASCII `P G S R` read little-endian. |
+| `version` | `u16` | 4 | Record format version. Currently `1`. |
+| `reserved` | `u16` | 6 | Reserved, `0`. |
+| `generation` | `u64` | 8 | Increases by one on every sync; the newest record has the highest. |
+| `free head` | `u64` | 16 | As in the superblock. |
+| `next new` | `u64` | 24 | As in the superblock. |
+| `free count` | `u64` | 32 | As in the superblock. |
+| `chain crc` | `u32` | 40 | CRC32C over the free-list ids in chain order, each as a little-endian `u64`. |
+| `record crc` | `u32` | 44 | CRC32C over record bytes `[0, 44)`. |
+
+A record is valid when its magic, version, and record CRC match. It does not
+depend on the page checksum, so a record survives a torn write of page 0 that
+leaves its own bytes intact.
+
+### Writing (1.1.0 and later)
+
+A sync of generation `N`:
+
+1. Writes the free-list links that changed since the last sync, then syncs.
+2. Writes page 0 with the superblock fields and copy A unchanged (generation
+   `N - 1`) and copy B set to generation `N`, then syncs.
+3. Writes page 0 with the superblock fields and copy A set to generation `N`
+   (copy B unchanged), then syncs.
+
+Copy A's bytes and copy B's bytes are never changed by the same write, except
+when a new file's superblock is first written, at the first sync of a file that
+has no records yet (one written by 1.0), and at the first sync after
+`PageAllocator::from_state`. The superblock fields always equal copy A, the
+newest committed state.
+
+### Reading (1.1.0 and later)
+
+1. Read page 0. If it verifies, the superblock fields must be valid (magic and
+   version) or the file is not an allocator file. If it fails verification, only
+   the records are trusted; with no valid record the read error is returned.
+2. Try the valid records from the highest generation down, then (if page 0
+   verified) the superblock fields. Take the first whose free-list walk succeeds
+   under the rules below and, for a record, whose chain CRC matches the ids
+   walked.
+3. If none does and at least one record is valid, open with the highest `next
+   new` among the valid records and an **empty** free-list. The pages that were
+   free are leaked, never handed out twice. If no record is valid, the error from
+   the superblock fields is returned, as in 1.0.
+
 ## Free-list chain
 
 Freed pages form an intrusive singly-linked list. The `free head` in the
@@ -192,7 +257,12 @@ A page write and a `sync` are separate steps: the write places bytes, the `sync`
 makes them durable. The allocator's superblock is written by its own `sync`,
 which MUST be ordered as part of the same checkpoint that makes the pages it
 handed out durable — the high-water mark must be durable no later than the data
-written to the ids beyond it. page-db provides the mechanism; a write-ahead log
+written to the ids beyond it. Within that sync, the free-list links reach stable
+storage before either superblock copy refers to them, and the two copies are
+written in separate synced steps (see [Writing](#writing-110-and-later)).
+
+A file created by `PageFile::open` has its parent directory flushed on the first
+successful sync (Unix), so the file's name is durable along with its pages. page-db provides the mechanism; a write-ahead log
 above is the authority on crash recovery, and the superblock is a checkpoint of
 allocator state, not a transaction log.
 
