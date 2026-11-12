@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-## [1.1.0] - 2026-11-11
+## [1.1.0] - 2026-11-12
 
 Fixes from an independent review of 1.0.0: a lost write in the buffer pool, a
 deadlock between a checkpoint and latch coupling, the write-ahead rule on
